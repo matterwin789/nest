@@ -4,9 +4,29 @@ create table if not exists public.todos (
   id uuid primary key default gen_random_uuid(),
   title text not null check (char_length(title) > 0 and char_length(title) <= 120),
   is_completed boolean not null default false,
+  position integer not null default 0,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
+
+alter table public.todos add column if not exists position integer;
+alter table public.todos alter column position set default 0;
+
+with ranked as (
+  select id, row_number() over (order by created_at asc, id asc) - 1 as next_position
+  from public.todos
+)
+update public.todos t
+set position = ranked.next_position
+from ranked
+where t.id = ranked.id
+  and (t.position is null or t.position < 0);
+
+update public.todos
+set position = 0
+where position is null;
+
+alter table public.todos alter column position set not null;
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -25,6 +45,7 @@ for each row
 execute function public.set_updated_at();
 
 create index if not exists todos_created_at_idx on public.todos (created_at desc);
+create index if not exists todos_position_idx on public.todos (position asc);
 
 alter table public.todos enable row level security;
 

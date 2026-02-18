@@ -2,6 +2,7 @@ export interface TodoRecord {
   id: string;
   title: string;
   is_completed: boolean;
+  position: number;
   created_at: string;
   updated_at: string;
 }
@@ -11,7 +12,9 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 
 export const hasSupabaseEnv = Boolean(supabaseUrl && supabaseAnonKey);
 
-const todoColumns = "id,title,is_completed,created_at,updated_at";
+const baseColumns = "id,title,is_completed,created_at,updated_at";
+const positionedColumns = `${baseColumns},position`;
+let supportsPositionColumn: boolean | null = null;
 
 function getConfig() {
   if (!supabaseUrl || !supabaseAnonKey) {
@@ -74,46 +77,120 @@ async function throwOnError(response: Response): Promise<void> {
 
 export async function listTodos(): Promise<TodoRecord[]> {
   const { url } = getConfig();
-  const query = new URLSearchParams({
-    select: todoColumns,
-    order: "created_at.desc",
-  });
 
-  const response = await fetch(`${url}/rest/v1/todos?${query.toString()}`, {
-    method: "GET",
-    headers: buildHeaders(),
-    cache: "no-store",
-  });
+  const withPositionQuery = new URLSearchParams({ select: positionedColumns });
+  withPositionQuery.append("order", "position.asc.nullslast");
+  withPositionQuery.append("order", "created_at.asc");
 
-  await throwOnError(response);
-  return (await response.json()) as TodoRecord[];
+  const withPositionResponse = await fetch(
+    `${url}/rest/v1/todos?${withPositionQuery.toString()}`,
+    {
+      method: "GET",
+      headers: buildHeaders(),
+      cache: "no-store",
+    },
+  );
+
+  if (withPositionResponse.ok) {
+    supportsPositionColumn = true;
+    const rows = (await withPositionResponse.json()) as TodoRecord[];
+    return rows.map((row, index) => ({ ...row, position: row.position ?? index }));
+  }
+
+  let fallbackReason = "Failed to load todos from Supabase.";
+  try {
+    const payload = (await withPositionResponse.json()) as { message?: string };
+    fallbackReason = payload.message ?? fallbackReason;
+  } catch {
+    // Keep fallback reason.
+  }
+
+  const missingPositionColumn =
+    fallbackReason.toLowerCase().includes("position") &&
+    (fallbackReason.toLowerCase().includes("column") ||
+      fallbackReason.toLowerCase().includes("does not exist"));
+
+  if (!missingPositionColumn) {
+    throw new Error(fallbackReason);
+  }
+
+  const fallbackQuery = new URLSearchParams({
+    select: baseColumns,
+    order: "created_at.asc",
+  });
+  const fallbackResponse = await fetch(
+    `${url}/rest/v1/todos?${fallbackQuery.toString()}`,
+    {
+      method: "GET",
+      headers: buildHeaders(),
+      cache: "no-store",
+    },
+  );
+
+  await throwOnError(fallbackResponse);
+  supportsPositionColumn = false;
+  const fallbackRows = (await fallbackResponse.json()) as Array<
+    Omit<TodoRecord, "position">
+  >;
+  return fallbackRows.map((row, index) => ({ ...row, position: index }));
 }
 
-export async function createTodo(title: string): Promise<TodoRecord> {
+function currentSelectColumns() {
+  return supportsPositionColumn === false ? baseColumns : positionedColumns;
+}
+
+function normalizeTodoFromApi(
+  row: Partial<TodoRecord>,
+  fallbackPosition: number,
+): TodoRecord {
+  return {
+    id: row.id ?? "",
+    title: row.title ?? "",
+    is_completed: Boolean(row.is_completed),
+    position:
+      typeof row.position === "number" ? row.position : Math.max(0, fallbackPosition),
+    created_at: row.created_at ?? new Date().toISOString(),
+    updated_at: row.updated_at ?? new Date().toISOString(),
+  };
+}
+
+export function isPositioningEnabled(): boolean {
+  return supportsPositionColumn !== false;
+}
+
+export async function createTodo(
+  title: string,
+  position: number,
+): Promise<TodoRecord> {
   const { url } = getConfig();
-  const response = await fetch(`${url}/rest/v1/todos?select=${todoColumns}`, {
-    method: "POST",
-    headers: buildHeaders("return=representation"),
-    body: JSON.stringify({ title }),
-  });
+  const body =
+    supportsPositionColumn === false ? { title } : { title, position };
+  const response = await fetch(
+    `${url}/rest/v1/todos?select=${currentSelectColumns()}`,
+    {
+      method: "POST",
+      headers: buildHeaders("return=representation"),
+      body: JSON.stringify(body),
+    },
+  );
 
   await throwOnError(response);
-  const rows = (await response.json()) as TodoRecord[];
+  const rows = (await response.json()) as Array<Partial<TodoRecord>>;
   const first = rows[0];
   if (!first) {
     throw new Error("Supabase did not return the new todo row.");
   }
-  return first;
+  return normalizeTodoFromApi(first, position);
 }
 
 export async function updateTodo(
   id: string,
-  updates: Partial<Pick<TodoRecord, "title" | "is_completed">>,
+  updates: Partial<Pick<TodoRecord, "title" | "is_completed" | "position">>,
 ): Promise<TodoRecord> {
   const { url } = getConfig();
   const query = new URLSearchParams({
     id: `eq.${id}`,
-    select: todoColumns,
+    select: currentSelectColumns(),
   });
 
   const response = await fetch(`${url}/rest/v1/todos?${query.toString()}`, {
@@ -123,12 +200,34 @@ export async function updateTodo(
   });
 
   await throwOnError(response);
-  const rows = (await response.json()) as TodoRecord[];
+  const rows = (await response.json()) as Array<Partial<TodoRecord>>;
   const first = rows[0];
   if (!first) {
     throw new Error("Todo not found.");
   }
-  return first;
+  return normalizeTodoFromApi(first, updates.position ?? 0);
+}
+
+export async function updateTodoPositions(
+  orderedIds: string[],
+): Promise<void> {
+  if (supportsPositionColumn === false) {
+    return;
+  }
+
+  const { url } = getConfig();
+  await Promise.all(
+    orderedIds.map(async (id, index) => {
+      const query = new URLSearchParams({ id: `eq.${id}` });
+      const response = await fetch(`${url}/rest/v1/todos?${query.toString()}`, {
+        method: "PATCH",
+        headers: buildHeaders("return=minimal"),
+        body: JSON.stringify({ position: index }),
+      });
+
+      await throwOnError(response);
+    }),
+  );
 }
 
 export async function deleteTodo(id: string): Promise<void> {

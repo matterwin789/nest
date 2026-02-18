@@ -1,6 +1,14 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  FormEvent,
+  PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -16,9 +24,11 @@ import {
   createTodo,
   deleteTodo,
   hasSupabaseEnv,
+  isPositioningEnabled,
   listTodos,
   type TodoRecord,
   updateTodo,
+  updateTodoPositions,
 } from "@/lib/supabase/rest";
 import { cn } from "@/lib/utils";
 
@@ -34,6 +44,20 @@ function formatTodoDate(dateValue: string): string {
   }).format(date);
 }
 
+function arrayMove<T>(items: T[], fromIndex: number, toIndex: number): T[] {
+  const next = [...items];
+  const [moved] = next.splice(fromIndex, 1);
+  if (!moved) {
+    return items;
+  }
+  next.splice(toIndex, 0, moved);
+  return next;
+}
+
+function normalizePositions(items: TodoRecord[]): TodoRecord[] {
+  return items.map((todo, index) => ({ ...todo, position: index }));
+}
+
 export function TodoApp() {
   const [todos, setTodos] = useState<TodoRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -44,6 +68,15 @@ export function TodoApp() {
   const [filter, setFilter] = useState<TodoFilter>("all");
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [positioningAvailable, setPositioningAvailable] = useState(true);
+  const [isSavingOrder, setIsSavingOrder] = useState(false);
+
+  const latestTodosRef = useRef<TodoRecord[]>([]);
+
+  useEffect(() => {
+    latestTodosRef.current = todos;
+  }, [todos]);
 
   const loadTodos = useCallback(async () => {
     if (!hasSupabaseEnv) {
@@ -54,7 +87,8 @@ export function TodoApp() {
     try {
       setError(null);
       const rows = await listTodos();
-      setTodos(rows);
+      setTodos(normalizePositions(rows));
+      setPositioningAvailable(isPositioningEnabled());
     } catch (loadError) {
       setError(
         loadError instanceof Error
@@ -86,6 +120,13 @@ export function TodoApp() {
     return todos;
   }, [filter, todos]);
 
+  const canReorder =
+    hasSupabaseEnv &&
+    filter === "all" &&
+    !editingId &&
+    !busyId &&
+    positioningAvailable;
+
   const handleAdd = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!hasSupabaseEnv || isAdding) {
@@ -100,8 +141,9 @@ export function TodoApp() {
     try {
       setError(null);
       setIsAdding(true);
-      const created = await createTodo(title);
-      setTodos((previous) => [created, ...previous]);
+      const position = latestTodosRef.current.length;
+      const created = await createTodo(title, position);
+      setTodos((previous) => normalizePositions([...previous, created]));
       setNewTitle("");
     } catch (createError) {
       setError(
@@ -148,7 +190,9 @@ export function TodoApp() {
       setError(null);
       setBusyId(id);
       await deleteTodo(id);
-      setTodos((previous) => previous.filter((item) => item.id !== id));
+      setTodos((previous) =>
+        normalizePositions(previous.filter((item) => item.id !== id)),
+      );
       if (editingId === id) {
         setEditingId(null);
         setEditingTitle("");
@@ -204,6 +248,94 @@ export function TodoApp() {
     }
   };
 
+  const startDrag = (
+    event: ReactPointerEvent<HTMLButtonElement>,
+    activeId: string,
+  ) => {
+    if (!canReorder) {
+      return;
+    }
+
+    event.preventDefault();
+    setError(null);
+    setDraggingId(activeId);
+
+    let moved = false;
+    const dragPointerId = event.pointerId;
+
+    document.body.style.userSelect = "none";
+    document.body.style.touchAction = "none";
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== dragPointerId) {
+        return;
+      }
+
+      moveEvent.preventDefault();
+      const target = document
+        .elementFromPoint(moveEvent.clientX, moveEvent.clientY)
+        ?.closest<HTMLElement>("[data-todo-id]");
+
+      const overId = target?.dataset.todoId;
+      if (!overId || overId === activeId) {
+        return;
+      }
+
+      setTodos((previous) => {
+        const fromIndex = previous.findIndex((todo) => todo.id === activeId);
+        const toIndex = previous.findIndex((todo) => todo.id === overId);
+        if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) {
+          return previous;
+        }
+        moved = true;
+        return normalizePositions(arrayMove(previous, fromIndex, toIndex));
+      });
+    };
+
+    const cleanup = () => {
+      document.body.style.userSelect = "";
+      document.body.style.touchAction = "";
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+      setDraggingId(null);
+    };
+
+    const handlePointerUp = async (upEvent: PointerEvent) => {
+      if (upEvent.pointerId !== dragPointerId) {
+        return;
+      }
+
+      cleanup();
+      if (!moved) {
+        return;
+      }
+
+      if (!positioningAvailable) {
+        return;
+      }
+
+      try {
+        setIsSavingOrder(true);
+        await updateTodoPositions(latestTodosRef.current.map((todo) => todo.id));
+      } catch (saveOrderError) {
+        setError(
+          saveOrderError instanceof Error
+            ? saveOrderError.message
+            : "Failed to persist task order.",
+        );
+      } finally {
+        setIsSavingOrder(false);
+      }
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, {
+      passive: false,
+    });
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+  };
+
   const emptyStateLabel =
     filter === "all"
       ? "No tasks yet. Add your first one."
@@ -212,7 +344,7 @@ export function TodoApp() {
         : "No completed tasks yet.";
 
   return (
-    <main className="min-h-screen px-4 py-8 sm:px-6 sm:py-12">
+    <main className="safe-area-shell">
       <div className="mx-auto w-full max-w-2xl">
         <Card>
           <CardHeader className="pb-4">
@@ -224,13 +356,18 @@ export function TodoApp() {
             </div>
             <CardTitle className="text-3xl leading-tight">Your reminders</CardTitle>
             <CardDescription>
-              Minimal by design. Add, complete, edit, and delete with everything
-              synced to Supabase.
+              Minimal by design. Add, complete, edit, delete, and drag to reorder.
             </CardDescription>
             <div className="mt-2 flex gap-2 text-xs text-muted-foreground">
               <span>{todos.length} total</span>
               <span>/</span>
               <span>{doneCount} done</span>
+              {isSavingOrder && (
+                <>
+                  <span>/</span>
+                  <span>Saving order...</span>
+                </>
+              )}
             </div>
           </CardHeader>
           <CardContent className="space-y-4">
@@ -238,6 +375,13 @@ export function TodoApp() {
               <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-200">
                 Add <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
                 <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> to start syncing.
+              </div>
+            )}
+
+            {!positioningAvailable && hasSupabaseEnv && (
+              <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
+                Drag reorder requires a <code>position</code> column. Run the updated
+                SQL in <code>supabase/schema.sql</code> and refresh.
               </div>
             )}
 
@@ -284,6 +428,12 @@ export function TodoApp() {
               </Button>
             </div>
 
+            {filter !== "all" && (
+              <p className="text-xs text-muted-foreground">
+                Switch to <strong>All</strong> to drag and reorder tasks.
+              </p>
+            )}
+
             <div className="space-y-2">
               {isLoading && (
                 <div className="rounded-lg border border-border/80 bg-muted/50 p-4 text-sm text-muted-foreground">
@@ -301,12 +451,16 @@ export function TodoApp() {
                 filteredTodos.map((todo) => {
                   const isBusy = busyId === todo.id;
                   const isEditing = editingId === todo.id;
+                  const isDragging = draggingId === todo.id;
+
                   return (
                     <article
                       key={todo.id}
+                      data-todo-id={todo.id}
                       className={cn(
                         "rounded-xl border border-border/80 bg-background/40 p-3 transition",
                         todo.is_completed && "opacity-70",
+                        isDragging && "scale-[1.01] border-primary/50 shadow-lg",
                       )}
                     >
                       <div className="flex items-start gap-3">
@@ -361,6 +515,16 @@ export function TodoApp() {
                             {formatTodoDate(todo.created_at)}
                           </p>
                         </div>
+
+                        <button
+                          type="button"
+                          onPointerDown={(event) => startDrag(event, todo.id)}
+                          disabled={!canReorder || isEditing || isBusy}
+                          aria-label="Drag to reorder"
+                          className="mt-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition hover:bg-muted disabled:opacity-40"
+                        >
+                          Drag
+                        </button>
                       </div>
 
                       <div className="mt-3 flex items-center justify-end gap-2">

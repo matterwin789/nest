@@ -4,6 +4,7 @@ Minimal, mobile-first reminders app built with:
 - React + Next.js (host on Vercel)
 - Supabase Postgres (store todos)
 - Dark mode UI from day one
+- Touch-friendly drag-and-drop task ordering
 
 ## 1. Local setup
 
@@ -50,4 +51,6 @@ Every push to `main` will auto-deploy.
 ## Notes
 
 - This first cut allows anonymous CRUD via RLS policies in `supabase/schema.sql`.
+- Drag reorder persists using the `position` column in `todos`.
+- If your project already existed before drag reorder, rerun `supabase/schema.sql` once to add/backfill `position`.
 - It is ideal for moving fast tonight, but you should add Supabase Auth + per-user policies before production.

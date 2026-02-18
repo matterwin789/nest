@@ -46,12 +46,27 @@
 body {
   color: var(--foreground);
   font-family: var(--font-sans-family);
+  min-height: 100dvh;
+  margin: 0;
   background:
     radial-gradient(circle at 0% 0%, #182945 0%, transparent 45%),
     radial-gradient(circle at 100% 0%, #1a2f55 0%, transparent 35%),
     linear-gradient(180deg, #070d18 0%, #090f1c 100%);
 }
 
+html {
+  background: #090f1c;
+  overscroll-behavior-y: none;
+}
+
 * {
   border-color: var(--border);
+}
+
+.safe-area-shell {
+  min-height: 100dvh;
+  padding-top: max(1rem, env(safe-area-inset-top));
+  padding-right: max(1rem, env(safe-area-inset-right));
+  padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  padding-left: max(1rem, env(safe-area-inset-left));
 }
