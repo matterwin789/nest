@@ -2,6 +2,7 @@
 
 import {
   FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
   useCallback,
   useEffect,
@@ -9,6 +10,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { GripVertical, Pencil, Trash2 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -33,6 +35,8 @@ import {
 import { cn } from "@/lib/utils";
 
 type TodoFilter = "all" | "open" | "done";
+type ControlRole = "toggle" | "drag" | "edit" | "delete" | "filter";
+const filterOrder: TodoFilter[] = ["all", "open", "done"];
 
 function formatTodoDate(dateValue: string): string {
   const date = new Date(dateValue);
@@ -69,14 +73,42 @@ export function TodoApp() {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
   const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [keyboardDragId, setKeyboardDragId] = useState<string | null>(null);
   const [positioningAvailable, setPositioningAvailable] = useState(true);
   const [isSavingOrder, setIsSavingOrder] = useState(false);
 
   const latestTodosRef = useRef<TodoRecord[]>([]);
+  const keyboardMovedRef = useRef(false);
+  const filterButtonRefs = useRef<Record<TodoFilter, HTMLButtonElement | null>>({
+    all: null,
+    open: null,
+    done: null,
+  });
+  const addInputRef = useRef<HTMLInputElement | null>(null);
+  const addButtonRef = useRef<HTMLButtonElement | null>(null);
+  const firstTodoToggleRef = useRef<HTMLButtonElement | null>(null);
+  const editingInputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const returnEditFocusIdRef = useRef<string | null>(null);
+  const todoControlRefs = useRef<
+    Record<string, Record<Exclude<ControlRole, "filter">, HTMLButtonElement | null>>
+  >({});
 
   useEffect(() => {
     latestTodosRef.current = todos;
   }, [todos]);
+
+  useEffect(() => {
+    if (!editingId) {
+      const returnId = returnEditFocusIdRef.current;
+      if (returnId) {
+        todoControlRefs.current[returnId]?.edit?.focus();
+        returnEditFocusIdRef.current = null;
+      }
+      return;
+    }
+
+    editingInputRefs.current[editingId]?.focus();
+  }, [editingId]);
 
   const loadTodos = useCallback(async () => {
     if (!hasSupabaseEnv) {
@@ -126,6 +158,346 @@ export function TodoApp() {
     !editingId &&
     !busyId &&
     positioningAvailable;
+  const firstVisibleTodoId = filteredTodos[0]?.id ?? null;
+  const visibleTodoIds = filteredTodos.map((todo) => todo.id);
+
+  const persistCurrentOrder = useCallback(async () => {
+    if (!positioningAvailable) {
+      return;
+    }
+
+    try {
+      setIsSavingOrder(true);
+      await updateTodoPositions(latestTodosRef.current.map((todo) => todo.id));
+    } catch (saveOrderError) {
+      setError(
+        saveOrderError instanceof Error
+          ? saveOrderError.message
+          : "Failed to persist task order.",
+      );
+    } finally {
+      setIsSavingOrder(false);
+    }
+  }, [positioningAvailable]);
+
+  const moveTodoByOffset = useCallback((activeId: string, offset: number) => {
+    let moved = false;
+    setTodos((previous) => {
+      const fromIndex = previous.findIndex((todo) => todo.id === activeId);
+      if (fromIndex === -1) {
+        return previous;
+      }
+
+      const toIndex = fromIndex + offset;
+      if (toIndex < 0 || toIndex >= previous.length) {
+        return previous;
+      }
+
+      moved = true;
+      return normalizePositions(arrayMove(previous, fromIndex, toIndex));
+    });
+    return moved;
+  }, []);
+
+  const setTodoControlRef = useCallback(
+    (
+      todoId: string,
+      role: Exclude<ControlRole, "filter">,
+      element: HTMLButtonElement | null,
+    ) => {
+      if (!todoControlRefs.current[todoId]) {
+        todoControlRefs.current[todoId] = {
+          toggle: null,
+          drag: null,
+          edit: null,
+          delete: null,
+        };
+      }
+      todoControlRefs.current[todoId][role] = element;
+    },
+    [],
+  );
+
+  const focusTodoControlByIndex = useCallback(
+    (index: number, role: Exclude<ControlRole, "filter">): boolean => {
+      const targetId = visibleTodoIds[index];
+      if (!targetId) {
+        return false;
+      }
+      const target = todoControlRefs.current[targetId]?.[role];
+      if (!target || target.disabled) {
+        return false;
+      }
+      target.focus();
+      return true;
+    },
+    [visibleTodoIds],
+  );
+
+  const focusByTabOrder = useCallback(
+    (currentElement: HTMLElement, direction: "forward" | "backward"): boolean => {
+      const focusables = Array.from(
+        document.querySelectorAll<HTMLElement>('[data-nav-managed="true"]'),
+      ).filter((element) => !element.hasAttribute("disabled"));
+
+      const currentIndex = focusables.indexOf(currentElement);
+      if (currentIndex === -1) {
+        return false;
+      }
+
+      const targetIndex =
+        direction === "forward" ? currentIndex + 1 : currentIndex - 1;
+      const next = focusables[targetIndex];
+      if (!next) {
+        return false;
+      }
+      next.focus();
+      return true;
+    },
+    [],
+  );
+
+  const handleAddInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      filterButtonRefs.current.all?.focus();
+      return;
+    }
+
+    if (
+      event.key === "ArrowRight" &&
+      event.currentTarget.selectionStart === event.currentTarget.value.length &&
+      event.currentTarget.selectionEnd === event.currentTarget.value.length
+    ) {
+      event.preventDefault();
+      addButtonRef.current?.focus();
+      return;
+    }
+
+    if (
+      event.key === "ArrowLeft" &&
+      event.currentTarget.selectionStart === 0 &&
+      event.currentTarget.selectionEnd === 0
+    ) {
+      const moved = focusByTabOrder(event.currentTarget, "backward");
+      if (moved) {
+        event.preventDefault();
+      }
+    }
+  };
+
+  const handleAddButtonKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      addInputRef.current?.focus();
+      return;
+    }
+
+    if (event.key === "ArrowRight") {
+      const moved = focusByTabOrder(event.currentTarget, "forward");
+      if (moved) {
+        event.preventDefault();
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      filterButtonRefs.current.all?.focus();
+    }
+  };
+
+  const handleFilterKeyDown = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    currentFilter: TodoFilter,
+  ) => {
+    if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      const currentIndex = filterOrder.indexOf(currentFilter);
+      const atStart = currentIndex === 0;
+      const atEnd = currentIndex === filterOrder.length - 1;
+
+      if (event.key === "ArrowLeft" && atStart) {
+        const moved = focusByTabOrder(event.currentTarget, "backward");
+        if (moved) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (event.key === "ArrowRight" && atEnd) {
+        const moved = focusByTabOrder(event.currentTarget, "forward");
+        if (moved) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      event.preventDefault();
+      const nextIndex = event.key === "ArrowRight" ? currentIndex + 1 : currentIndex - 1;
+      filterButtonRefs.current[filterOrder[nextIndex]]?.focus();
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      firstTodoToggleRef.current?.focus();
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      addInputRef.current?.focus();
+    }
+  };
+
+  const handleTodoControlNavigation = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    todoIndex: number,
+    role: Exclude<ControlRole, "filter">,
+    todoId: string,
+  ) => {
+    const key = event.key;
+    let moved = false;
+    const isCurrentEditing = editingId === todoId;
+
+    if (key === "ArrowLeft") {
+      if (role === "toggle") {
+        moved = focusByTabOrder(event.currentTarget, "backward");
+      } else if (role === "drag") {
+        if (isCurrentEditing) {
+          editingInputRefs.current[todoId]?.focus();
+          moved = true;
+        } else {
+          moved = focusTodoControlByIndex(todoIndex, "toggle");
+        }
+      } else if (role === "edit") {
+        moved = focusByTabOrder(event.currentTarget, "backward");
+      } else if (role === "delete") {
+        moved = focusTodoControlByIndex(todoIndex, "edit");
+      }
+    }
+
+    if (key === "ArrowRight") {
+      if (role === "toggle") {
+        if (isCurrentEditing) {
+          editingInputRefs.current[todoId]?.focus();
+          moved = true;
+        } else {
+          moved = focusTodoControlByIndex(todoIndex, "drag");
+        }
+      } else if (role === "drag") {
+        moved = focusByTabOrder(event.currentTarget, "forward");
+      } else if (role === "edit") {
+        moved = focusTodoControlByIndex(todoIndex, "delete");
+      } else if (role === "delete") {
+        moved = focusByTabOrder(event.currentTarget, "forward");
+      }
+    }
+
+    if (key === "ArrowUp") {
+      if (role === "toggle" || role === "drag") {
+        if (todoIndex === 0) {
+          filterButtonRefs.current.all?.focus();
+          moved = true;
+        } else {
+          moved = focusTodoControlByIndex(todoIndex - 1, "edit");
+        }
+      } else if (role === "edit" || role === "delete") {
+        moved = focusTodoControlByIndex(todoIndex, "toggle");
+      }
+    }
+
+    if (key === "ArrowDown") {
+      if (role === "toggle") {
+        moved = focusTodoControlByIndex(todoIndex, "edit");
+      } else if (role === "drag") {
+        moved = focusTodoControlByIndex(todoIndex, "delete");
+      } else if (role === "edit" || role === "delete") {
+        moved = focusTodoControlByIndex(todoIndex + 1, "toggle");
+      }
+    }
+
+    if (moved) {
+      event.preventDefault();
+    }
+  };
+
+  const handleEditingInputKeyDown = (
+    event: ReactKeyboardEvent<HTMLInputElement>,
+    todoIndex: number,
+    todoId: string,
+  ) => {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      todoControlRefs.current[todoId]?.toggle?.focus();
+      return;
+    }
+
+    if (event.key === "ArrowRight") {
+      event.preventDefault();
+      todoControlRefs.current[todoId]?.drag?.focus();
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      if (todoIndex === 0) {
+        filterButtonRefs.current.all?.focus();
+      } else {
+        focusTodoControlByIndex(todoIndex - 1, "edit");
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      focusTodoControlByIndex(todoIndex + 1, "toggle");
+    }
+  };
+
+  useEffect(() => {
+    const handleWindowArrowFocus = (event: KeyboardEvent) => {
+      if (
+        event.key !== "ArrowUp" &&
+        event.key !== "ArrowDown" &&
+        event.key !== "ArrowLeft" &&
+        event.key !== "ArrowRight"
+      ) {
+        return;
+      }
+
+      const active = document.activeElement as HTMLElement | null;
+      const isManaged =
+        active?.dataset.navManaged === "true" ||
+        active?.tagName.toLowerCase() === "input";
+
+      if (isManaged) {
+        return;
+      }
+
+      event.preventDefault();
+      addInputRef.current?.focus();
+    };
+
+    window.addEventListener("keydown", handleWindowArrowFocus);
+    return () => {
+      window.removeEventListener("keydown", handleWindowArrowFocus);
+    };
+  }, []);
+
+  const deactivateKeyboardDrag = useCallback(
+    (shouldPersistOrder: boolean) => {
+      const movedDuringSession = keyboardMovedRef.current;
+      keyboardMovedRef.current = false;
+      setKeyboardDragId(null);
+      setDraggingId(null);
+
+      if (shouldPersistOrder && movedDuringSession) {
+        void persistCurrentOrder();
+      }
+    },
+    [persistCurrentOrder],
+  );
 
   const handleAdd = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -194,6 +566,7 @@ export function TodoApp() {
         normalizePositions(previous.filter((item) => item.id !== id)),
       );
       if (editingId === id) {
+        returnEditFocusIdRef.current = id;
         setEditingId(null);
         setEditingTitle("");
       }
@@ -214,6 +587,9 @@ export function TodoApp() {
   };
 
   const cancelEdit = () => {
+    if (editingId) {
+      returnEditFocusIdRef.current = editingId;
+    }
     setEditingId(null);
     setEditingTitle("");
   };
@@ -236,6 +612,7 @@ export function TodoApp() {
       setTodos((previous) =>
         previous.map((item) => (item.id === updated.id ? updated : item)),
       );
+      returnEditFocusIdRef.current = editingId;
       cancelEdit();
     } catch (saveError) {
       setError(
@@ -252,6 +629,10 @@ export function TodoApp() {
     event: ReactPointerEvent<HTMLButtonElement>,
     activeId: string,
   ) => {
+    if (keyboardDragId) {
+      return;
+    }
+
     if (!canReorder) {
       return;
     }
@@ -315,18 +696,7 @@ export function TodoApp() {
         return;
       }
 
-      try {
-        setIsSavingOrder(true);
-        await updateTodoPositions(latestTodosRef.current.map((todo) => todo.id));
-      } catch (saveOrderError) {
-        setError(
-          saveOrderError instanceof Error
-            ? saveOrderError.message
-            : "Failed to persist task order.",
-        );
-      } finally {
-        setIsSavingOrder(false);
-      }
+      await persistCurrentOrder();
     };
 
     window.addEventListener("pointermove", handlePointerMove, {
@@ -334,6 +704,71 @@ export function TodoApp() {
     });
     window.addEventListener("pointerup", handlePointerUp);
     window.addEventListener("pointercancel", handlePointerUp);
+  };
+
+  const handleDragHandleKeyDown = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    todoId: string,
+    todoIndex: number,
+  ) => {
+    const isActiveKeyboardDrag = keyboardDragId === todoId;
+
+    if ((event.key === "Enter" || event.key === " ") && !canReorder) {
+      return;
+    }
+
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      if (isActiveKeyboardDrag) {
+        deactivateKeyboardDrag(true);
+      } else {
+        keyboardMovedRef.current = false;
+        setError(null);
+        setKeyboardDragId(todoId);
+        setDraggingId(todoId);
+      }
+      return;
+    }
+
+    if (!isActiveKeyboardDrag) {
+      if (
+        event.key === "ArrowUp" ||
+        event.key === "ArrowDown" ||
+        event.key === "ArrowLeft" ||
+        event.key === "ArrowRight"
+      ) {
+        handleTodoControlNavigation(event, todoIndex, "drag", todoId);
+      }
+      return;
+    }
+
+    if (event.key === "ArrowUp") {
+      event.preventDefault();
+      const moved = moveTodoByOffset(todoId, -1);
+      if (moved) {
+        keyboardMovedRef.current = true;
+      }
+      return;
+    }
+
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      const moved = moveTodoByOffset(todoId, 1);
+      if (moved) {
+        keyboardMovedRef.current = true;
+      }
+      return;
+    }
+
+    if (event.key === "Tab") {
+      deactivateKeyboardDrag(true);
+      return;
+    }
+
+    if (event.key === "Escape") {
+      event.preventDefault();
+      deactivateKeyboardDrag(false);
+    }
   };
 
   const emptyStateLabel =
@@ -393,13 +828,22 @@ export function TodoApp() {
 
             <form className="flex items-center gap-2" onSubmit={handleAdd}>
               <Input
+                ref={addInputRef}
+                data-nav-managed="true"
                 value={newTitle}
                 onChange={(event) => setNewTitle(event.target.value)}
+                onKeyDown={handleAddInputKeyDown}
                 placeholder="Add a task for today"
                 maxLength={120}
                 disabled={!hasSupabaseEnv || isAdding}
               />
-              <Button type="submit" disabled={!hasSupabaseEnv || isAdding}>
+              <Button
+                ref={addButtonRef}
+                data-nav-managed="true"
+                type="submit"
+                onKeyDown={handleAddButtonKeyDown}
+                disabled={!hasSupabaseEnv || isAdding}
+              >
                 {isAdding ? "Adding" : "Add"}
               </Button>
             </form>
@@ -408,6 +852,12 @@ export function TodoApp() {
               <Button
                 variant={filter === "all" ? "secondary" : "ghost"}
                 size="sm"
+                data-control-role="filter"
+                data-nav-managed="true"
+                ref={(element) => {
+                  filterButtonRefs.current.all = element;
+                }}
+                onKeyDown={(event) => handleFilterKeyDown(event, "all")}
                 onClick={() => setFilter("all")}
               >
                 All
@@ -415,6 +865,12 @@ export function TodoApp() {
               <Button
                 variant={filter === "open" ? "secondary" : "ghost"}
                 size="sm"
+                data-control-role="filter"
+                data-nav-managed="true"
+                ref={(element) => {
+                  filterButtonRefs.current.open = element;
+                }}
+                onKeyDown={(event) => handleFilterKeyDown(event, "open")}
                 onClick={() => setFilter("open")}
               >
                 Open
@@ -422,6 +878,12 @@ export function TodoApp() {
               <Button
                 variant={filter === "done" ? "secondary" : "ghost"}
                 size="sm"
+                data-control-role="filter"
+                data-nav-managed="true"
+                ref={(element) => {
+                  filterButtonRefs.current.done = element;
+                }}
+                onKeyDown={(event) => handleFilterKeyDown(event, "done")}
                 onClick={() => setFilter("done")}
               >
                 Done
@@ -431,6 +893,12 @@ export function TodoApp() {
             {filter !== "all" && (
               <p className="text-xs text-muted-foreground">
                 Switch to <strong>All</strong> to drag and reorder tasks.
+              </p>
+            )}
+            {filter === "all" && positioningAvailable && (
+              <p className="text-xs text-muted-foreground">
+                Tab to a drag icon, press Enter or Space to grab, use Up/Down
+                arrows, then Enter or Tab to drop.
               </p>
             )}
 
@@ -448,10 +916,11 @@ export function TodoApp() {
               )}
 
               {!isLoading &&
-                filteredTodos.map((todo) => {
+                filteredTodos.map((todo, todoIndex) => {
                   const isBusy = busyId === todo.id;
                   const isEditing = editingId === todo.id;
-                  const isDragging = draggingId === todo.id;
+                  const isDragging =
+                    draggingId === todo.id || keyboardDragId === todo.id;
 
                   return (
                     <article
@@ -462,6 +931,11 @@ export function TodoApp() {
                         todo.is_completed && "opacity-70",
                         isDragging && "scale-[1.01] border-primary/50 shadow-lg",
                       )}
+                      style={
+                        isDragging
+                          ? { outline: "auto", outlineOffset: "2px" }
+                          : undefined
+                      }
                     >
                       <div className="flex items-start gap-3">
                         <button
@@ -471,19 +945,39 @@ export function TodoApp() {
                               ? "Mark task as not completed"
                               : "Mark task as completed"
                           }
+                          data-control-role="toggle"
+                          data-nav-managed="true"
                           className={cn(
                             "mt-1 h-5 w-5 rounded-full border transition",
                             todo.is_completed
                               ? "border-primary bg-primary"
                               : "border-muted-foreground/60 bg-transparent hover:border-primary",
                           )}
+                          onKeyDown={(event) =>
+                            handleTodoControlNavigation(
+                              event,
+                              todoIndex,
+                              "toggle",
+                              todo.id,
+                            )
+                          }
+                          ref={(element) => {
+                            if (todo.id === firstVisibleTodoId) {
+                              firstTodoToggleRef.current = element;
+                            }
+                            setTodoControlRef(todo.id, "toggle", element);
+                          }}
                           onClick={() => void handleToggle(todo)}
-                          disabled={!hasSupabaseEnv || isBusy}
+                          disabled={!hasSupabaseEnv}
                         />
 
                         <div className="min-w-0 flex-1">
                           {isEditing ? (
                             <Input
+                              ref={(element) => {
+                                editingInputRefs.current[todo.id] = element;
+                              }}
+                              data-nav-managed="true"
                               value={editingTitle}
                               onChange={(event) =>
                                 setEditingTitle(event.target.value)
@@ -491,6 +985,15 @@ export function TodoApp() {
                               maxLength={120}
                               disabled={isBusy}
                               onKeyDown={(event) => {
+                                if (
+                                  event.key === "ArrowLeft" ||
+                                  event.key === "ArrowRight" ||
+                                  event.key === "ArrowUp" ||
+                                  event.key === "ArrowDown"
+                                ) {
+                                  handleEditingInputKeyDown(event, todoIndex, todo.id);
+                                  return;
+                                }
                                 if (event.key === "Enter") {
                                   event.preventDefault();
                                   void saveEdit();
@@ -518,16 +1021,32 @@ export function TodoApp() {
 
                         <button
                           type="button"
+                          data-control-role="drag"
+                          data-nav-managed="true"
                           onPointerDown={(event) => startDrag(event, todo.id)}
-                          disabled={!canReorder || isEditing || isBusy}
-                          aria-label="Drag to reorder"
-                          className="mt-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition hover:bg-muted disabled:opacity-40"
+                          onKeyDown={(event) =>
+                            handleDragHandleKeyDown(event, todo.id, todoIndex)
+                          }
+                          disabled={
+                            !canReorder ||
+                            isEditing ||
+                            isBusy ||
+                            (keyboardDragId !== null && keyboardDragId !== todo.id)
+                          }
+                          aria-label={
+                            keyboardDragId === todo.id
+                              ? "Dragging. Use up and down arrows to move. Press Enter or Tab to drop."
+                              : "Drag to reorder"
+                          }
+                          aria-pressed={keyboardDragId === todo.id}
+                          ref={(element) => setTodoControlRef(todo.id, "drag", element)}
+                          className="mt-1 inline-flex touch-none items-center rounded p-1 text-muted-foreground transition hover:text-foreground disabled:opacity-40"
                         >
-                          Drag
+                          <GripVertical className="h-4 w-4" />
                         </button>
                       </div>
 
-                      <div className="mt-3 flex items-center justify-end gap-2">
+                      <div className="mt-3 flex items-center justify-start gap-2">
                         {isEditing ? (
                           <>
                             <Button
@@ -552,18 +1071,47 @@ export function TodoApp() {
                             <Button
                               variant="ghost"
                               size="sm"
+                              data-control-role="edit"
+                              data-nav-managed="true"
+                              onKeyDown={(event) =>
+                                handleTodoControlNavigation(
+                                  event,
+                                  todoIndex,
+                                  "edit",
+                                  todo.id,
+                                )
+                              }
                               onClick={() => startEdit(todo)}
                               disabled={!hasSupabaseEnv || isBusy}
+                              aria-label="Edit task"
+                              title="Edit"
+                              ref={(element) => setTodoControlRef(todo.id, "edit", element)}
                             >
-                              Edit
+                              <Pencil className="h-4 w-4" />
                             </Button>
                             <Button
-                              variant="danger"
+                              variant="ghost"
                               size="sm"
+                              data-control-role="delete"
+                              data-nav-managed="true"
+                              onKeyDown={(event) =>
+                                handleTodoControlNavigation(
+                                  event,
+                                  todoIndex,
+                                  "delete",
+                                  todo.id,
+                                )
+                              }
                               onClick={() => void handleDelete(todo.id)}
                               disabled={!hasSupabaseEnv || isBusy}
+                              aria-label="Delete task"
+                              title="Delete"
+                              className="text-muted-foreground hover:text-foreground"
+                              ref={(element) =>
+                                setTodoControlRef(todo.id, "delete", element)
+                              }
                             >
-                              Delete
+                              <Trash2 className="h-4 w-4" />
                             </Button>
                           </>
                         )}
