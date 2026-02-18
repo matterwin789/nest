@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  --font-sans-family: "Avenir Next", "Nunito Sans", "Segoe UI", sans-serif;
+  --font-mono-family: "IBM Plex Mono", "SFMono-Regular", "Menlo", monospace;
+  --background: #090f1c;
+  --foreground: #f4f8ff;
+  --card: #101a2d;
+  --card-foreground: #f4f8ff;
+  --primary: #dce8ff;
+  --primary-foreground: #0f1628;
+  --secondary: #1b2942;
+  --secondary-foreground: #dee9ff;
+  --muted: #19263d;
+  --muted-foreground: #9cb0d1;
+  --destructive: #ff7272;
+  --destructive-foreground: #fff4f4;
+  --border: #253653;
+  --ring: #8cb0ff;
+  --radius: 1rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 6px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 6px);
+  --font-sans: var(--font-sans-family);
+  --font-mono: var(--font-mono-family);
+}
+
+body {
+  color: var(--foreground);
+  font-family: var(--font-sans-family);
+  background:
+    radial-gradient(circle at 0% 0%, #182945 0%, transparent 45%),
+    radial-gradient(circle at 100% 0%, #1a2f55 0%, transparent 35%),
+    linear-gradient(180deg, #070d18 0%, #090f1c 100%);
+}
+
+* {
+  border-color: var(--border);
+}
