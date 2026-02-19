@@ -3,20 +3,20 @@
 :root {
   --font-sans-family: "Avenir Next", "Nunito Sans", "Segoe UI", sans-serif;
   --font-mono-family: "IBM Plex Mono", "SFMono-Regular", "Menlo", monospace;
-  --background: #090f1c;
-  --foreground: #f4f8ff;
-  --card: #101a2d;
-  --card-foreground: #f4f8ff;
-  --primary: #dce8ff;
-  --primary-foreground: #0f1628;
-  --secondary: #1b2942;
-  --secondary-foreground: #dee9ff;
-  --muted: #19263d;
-  --muted-foreground: #9cb0d1;
+  --background: #0d1117;
+  --foreground: #e6edf3;
+  --card: #161b22;
+  --card-foreground: #e6edf3;
+  --primary: #c9d1d9;
+  --primary-foreground: #0d1117;
+  --secondary: #21262d;
+  --secondary-foreground: #c9d1d9;
+  --muted: #1a1f26;
+  --muted-foreground: #8b949e;
   --destructive: #ff7272;
   --destructive-foreground: #fff4f4;
-  --border: #253653;
-  --ring: #8cb0ff;
+  --border: #30363d;
+  --ring: #8b949e;
   --radius: 1rem;
 }
 
@@ -48,14 +48,11 @@ body {
   font-family: var(--font-sans-family);
   min-height: 100dvh;
   margin: 0;
-  background:
-    radial-gradient(circle at 0% 0%, #182945 0%, transparent 45%),
-    radial-gradient(circle at 100% 0%, #1a2f55 0%, transparent 35%),
-    linear-gradient(180deg, #070d18 0%, #090f1c 100%);
+  background: var(--background);
 }
 
 html {
-  background: #090f1c;
+  background: var(--background);
   overscroll-behavior-y: none;
 }
 

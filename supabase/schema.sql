@@ -5,12 +5,15 @@ create table if not exists public.todos (
   title text not null check (char_length(title) > 0 and char_length(title) <= 120),
   is_completed boolean not null default false,
   position integer not null default 0,
+  parent_id uuid references public.todos(id) on delete set null,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now()
 );
 
 alter table public.todos add column if not exists position integer;
 alter table public.todos alter column position set default 0;
+alter table public.todos
+  add column if not exists parent_id uuid references public.todos(id) on delete set null;
 
 with ranked as (
   select id, row_number() over (order by created_at asc, id asc) - 1 as next_position
@@ -46,6 +49,7 @@ execute function public.set_updated_at();
 
 create index if not exists todos_created_at_idx on public.todos (created_at desc);
 create index if not exists todos_position_idx on public.todos (position asc);
+create index if not exists todos_parent_id_idx on public.todos (parent_id);
 
 alter table public.todos enable row level security;
 

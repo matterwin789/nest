@@ -3,6 +3,7 @@ export interface TodoRecord {
   title: string;
   is_completed: boolean;
   position: number;
+  parent_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -13,8 +14,11 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 export const hasSupabaseEnv = Boolean(supabaseUrl && supabaseAnonKey);
 
 const baseColumns = "id,title,is_completed,created_at,updated_at";
-const positionedColumns = `${baseColumns},position`;
+const parentColumns = `${baseColumns},parent_id`;
+const positionedColumns = `${parentColumns},position`;
+const positionedNoParentColumns = `${baseColumns},position`;
 let supportsPositionColumn: boolean | null = null;
+let supportsParentColumn: boolean | null = null;
 
 function getConfig() {
   if (!supabaseUrl || !supabaseAnonKey) {
@@ -93,6 +97,7 @@ export async function listTodos(): Promise<TodoRecord[]> {
 
   if (withPositionResponse.ok) {
     supportsPositionColumn = true;
+    supportsParentColumn = true;
     const rows = (await withPositionResponse.json()) as TodoRecord[];
     return rows.map((row, index) => ({ ...row, position: row.position ?? index }));
   }
@@ -103,6 +108,39 @@ export async function listTodos(): Promise<TodoRecord[]> {
     fallbackReason = payload.message ?? fallbackReason;
   } catch {
     // Keep fallback reason.
+  }
+
+  const isMissingParentColumn =
+    fallbackReason.toLowerCase().includes("parent_id") &&
+    (fallbackReason.toLowerCase().includes("column") ||
+      fallbackReason.toLowerCase().includes("does not exist"));
+
+  if (isMissingParentColumn) {
+    const withoutParentQuery = new URLSearchParams({
+      select: positionedNoParentColumns,
+    });
+    withoutParentQuery.append("order", "position.asc.nullslast");
+    withoutParentQuery.append("order", "created_at.asc");
+    const withoutParentResponse = await fetch(
+      `${url}/rest/v1/todos?${withoutParentQuery.toString()}`,
+      {
+        method: "GET",
+        headers: buildHeaders(),
+        cache: "no-store",
+      },
+    );
+
+    await throwOnError(withoutParentResponse);
+    supportsPositionColumn = true;
+    supportsParentColumn = false;
+    const rows = (await withoutParentResponse.json()) as Array<
+      Omit<TodoRecord, "parent_id">
+    >;
+    return rows.map((row, index) => ({
+      ...row,
+      parent_id: null,
+      position: row.position ?? index,
+    }));
   }
 
   const missingPositionColumn =
@@ -129,14 +167,24 @@ export async function listTodos(): Promise<TodoRecord[]> {
 
   await throwOnError(fallbackResponse);
   supportsPositionColumn = false;
+  supportsParentColumn = false;
   const fallbackRows = (await fallbackResponse.json()) as Array<
-    Omit<TodoRecord, "position">
+    Omit<TodoRecord, "position" | "parent_id">
   >;
-  return fallbackRows.map((row, index) => ({ ...row, position: index }));
+  return fallbackRows.map((row, index) => ({
+    ...row,
+    parent_id: null,
+    position: index,
+  }));
 }
 
 function currentSelectColumns() {
-  return supportsPositionColumn === false ? baseColumns : positionedColumns;
+  if (supportsPositionColumn === false) {
+    return supportsParentColumn === false ? baseColumns : parentColumns;
+  }
+  return supportsParentColumn === false
+    ? positionedNoParentColumns
+    : positionedColumns;
 }
 
 function normalizeTodoFromApi(
@@ -149,6 +197,7 @@ function normalizeTodoFromApi(
     is_completed: Boolean(row.is_completed),
     position:
       typeof row.position === "number" ? row.position : Math.max(0, fallbackPosition),
+    parent_id: row.parent_id ?? null,
     created_at: row.created_at ?? new Date().toISOString(),
     updated_at: row.updated_at ?? new Date().toISOString(),
   };
@@ -185,7 +234,9 @@ export async function createTodo(
 
 export async function updateTodo(
   id: string,
-  updates: Partial<Pick<TodoRecord, "title" | "is_completed" | "position">>,
+  updates: Partial<
+    Pick<TodoRecord, "title" | "is_completed" | "position" | "parent_id">
+  >,
 ): Promise<TodoRecord> {
   const { url } = getConfig();
   const query = new URLSearchParams({
