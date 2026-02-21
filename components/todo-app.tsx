@@ -1,26 +1,13 @@
 "use client";
 
-import {
-  KeyboardEvent as ReactKeyboardEvent,
-  PointerEvent as ReactPointerEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import {
-  Card,
-  CardContent,
-  CardHeader,
-} from "@/components/ui/card";
-import { MoreHorizontal } from "lucide-react";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { ChevronDown, ChevronRight, Eye, EyeOff } from "lucide-react";
 import {
   createTodo,
   deleteTodo,
   hasSupabaseEnv,
-  isPositioningEnabled,
   listTodos,
   type TodoRecord,
   updateTodo,
@@ -28,443 +15,158 @@ import {
 } from "@/lib/supabase/rest";
 import { cn } from "@/lib/utils";
 
-function arrayMove<T>(items: T[], fromIndex: number, toIndex: number): T[] {
-  const next = [...items];
-  const [moved] = next.splice(fromIndex, 1);
-  if (!moved) {
-    return items;
-  }
-  next.splice(toIndex, 0, moved);
-  return next;
-}
-
 function normalizePositions(items: TodoRecord[]): TodoRecord[] {
   return items.map((todo, index) => ({ ...todo, position: index }));
 }
 
-const CARD_HOLD_TO_DRAG_MS = 180;
-const CARD_MOVE_CANCEL_PX = 6;
-const CARD_HORIZONTAL_NEST_PX = 36;
+const NEW_TASK_ACTIVE_ID = "__new_task__";
+const MULTI_BUSY_ID = "__multi__";
 
-function compactAndMoveSelection(
-  items: TodoRecord[],
-  selectedIds: string[],
-  activeId: string,
-  offset: -1 | 1,
-): { next: TodoRecord[]; changed: boolean } {
-  const selectedSet = new Set(selectedIds);
-  const orderedSelected = items.filter((todo) => selectedSet.has(todo.id));
-  const block = orderedSelected.length
-    ? orderedSelected
-    : items.filter((todo) => todo.id === activeId);
-  if (!block.length) {
-    return { next: items, changed: false };
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) {
+    return false;
   }
 
-  const anchorIndex = items.findIndex((todo) => todo.id === block[0]?.id);
-  if (anchorIndex === -1) {
-    return { next: items, changed: false };
-  }
-
-  const blockSet = new Set(block.map((todo) => todo.id));
-  const stationary = items.filter((todo) => !blockSet.has(todo.id));
-  const compacted = [...stationary];
-  compacted.splice(anchorIndex, 0, ...block);
-
-  const canMoveUp = offset < 0 && anchorIndex > 0;
-  const canMoveDown = offset > 0 && anchorIndex + block.length < compacted.length;
-
-  if (!canMoveUp && !canMoveDown) {
-    const changed = compacted.some((todo, index) => todo.id !== items[index]?.id);
-    return { next: changed ? normalizePositions(compacted) : items, changed };
-  }
-
-  const withoutBlock = compacted.filter((todo) => !blockSet.has(todo.id));
-  const nextStart = anchorIndex + offset;
-  const moved = [...withoutBlock];
-  moved.splice(nextStart, 0, ...block);
-
-  const changed = moved.some((todo, index) => todo.id !== items[index]?.id);
-  return { next: changed ? normalizePositions(moved) : items, changed };
+  const tag = target.tagName;
+  return (
+    target.isContentEditable ||
+    tag === "INPUT" ||
+    tag === "TEXTAREA" ||
+    tag === "SELECT"
+  );
 }
 
-function compactSelectionAtAnchor(
+function resizeTextarea(element: HTMLTextAreaElement | null): void {
+  if (!element) {
+    return;
+  }
+  const styles = window.getComputedStyle(element);
+  const lineHeight = Number.parseFloat(styles.lineHeight) || 24;
+  element.style.height = "0px";
+  const measuredHeight = element.scrollHeight;
+  const isSingleLine = measuredHeight <= lineHeight + 1;
+  element.style.height = `${isSingleLine ? lineHeight : measuredHeight}px`;
+}
+
+function buildDepthMap(items: TodoRecord[]): Record<string, number> {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const cache = new Map<string, number>();
+
+  const getDepth = (id: string, seen: Set<string>): number => {
+    if (cache.has(id)) {
+      return cache.get(id) ?? 0;
+    }
+
+    const item = byId.get(id);
+    if (!item?.parent_id) {
+      cache.set(id, 0);
+      return 0;
+    }
+
+    if (seen.has(id) || !byId.has(item.parent_id)) {
+      cache.set(id, 0);
+      return 0;
+    }
+
+    const nextSeen = new Set(seen);
+    nextSeen.add(id);
+    const depth = getDepth(item.parent_id, nextSeen) + 1;
+    cache.set(id, depth);
+    return depth;
+  };
+
+  const depths: Record<string, number> = {};
+  items.forEach((item) => {
+    depths[item.id] = getDepth(item.id, new Set());
+  });
+  return depths;
+}
+
+function reorderBySiblingMove(
   items: TodoRecord[],
-  selectedIds: string[],
   activeId: string,
-): { compacted: TodoRecord[]; block: TodoRecord[]; anchorIndex: number } | null {
-  const selectedSet = new Set(selectedIds);
-  const orderedSelected = items.filter((todo) => selectedSet.has(todo.id));
-  const block = orderedSelected.length
-    ? orderedSelected
-    : items.filter((todo) => todo.id === activeId);
-  if (!block.length) {
+  direction: -1 | 1,
+): TodoRecord[] | null {
+  const byId = new Map(items.map((item) => [item.id, item]));
+  const parentKey = (item: TodoRecord) =>
+    item.parent_id && byId.has(item.parent_id) ? item.parent_id : null;
+
+  const childrenByParent = new Map<string | null, TodoRecord[]>();
+  const pushChild = (key: string | null, item: TodoRecord) => {
+    const current = childrenByParent.get(key);
+    if (current) {
+      current.push(item);
+      return;
+    }
+    childrenByParent.set(key, [item]);
+  };
+
+  items.forEach((item) => pushChild(parentKey(item), item));
+
+  const active = byId.get(activeId);
+  if (!active) {
     return null;
   }
 
-  const anchorIndex = items.findIndex((todo) => todo.id === block[0]?.id);
-  if (anchorIndex === -1) {
+  const activeParentKey = parentKey(active);
+  const siblings = childrenByParent.get(activeParentKey) ?? [];
+  const currentIndex = siblings.findIndex((item) => item.id === activeId);
+  if (currentIndex === -1) {
     return null;
   }
 
-  const blockSet = new Set(block.map((todo) => todo.id));
-  const stationary = items.filter((todo) => !blockSet.has(todo.id));
-  const compacted = [...stationary];
-  compacted.splice(anchorIndex, 0, ...block);
-  return { compacted, block, anchorIndex };
-}
-
-function normalizeMovedParentsAfterReorder(
-  items: TodoRecord[],
-  movedIds: string[],
-): { next: TodoRecord[]; parentUpdates: Array<{ id: string; parent_id: string | null }> } {
-  const next = items.map((todo) => ({ ...todo }));
-  const byId = new Map(next.map((todo) => [todo.id, todo]));
-  const indexById = new Map(next.map((todo, index) => [todo.id, index]));
-  const parentUpdates: Array<{ id: string; parent_id: string | null }> = [];
-
-  for (const movedId of movedIds) {
-    const todo = byId.get(movedId);
-    if (!todo) {
-      continue;
-    }
-
-    let changed = false;
-    while (todo.parent_id) {
-      const parent = byId.get(todo.parent_id);
-      if (!parent) {
-        todo.parent_id = null;
-        changed = true;
-        break;
-      }
-
-      const parentIndex = indexById.get(parent.id) ?? -1;
-      const todoIndex = indexById.get(todo.id) ?? -1;
-      if (parentIndex !== -1 && parentIndex < todoIndex) {
-        break;
-      }
-
-      todo.parent_id = parent.parent_id ?? null;
-      changed = true;
-    }
-
-    if (changed) {
-      parentUpdates.push({ id: todo.id, parent_id: todo.parent_id ?? null });
-    }
+  const nextIndex = currentIndex + direction;
+  if (nextIndex < 0 || nextIndex >= siblings.length) {
+    return null;
   }
 
-  return { next, parentUpdates };
+  const reorderedSiblings = [...siblings];
+  const [moved] = reorderedSiblings.splice(currentIndex, 1);
+  reorderedSiblings.splice(nextIndex, 0, moved);
+  childrenByParent.set(activeParentKey, reorderedSiblings);
+
+  const ordered: TodoRecord[] = [];
+  const visit = (key: string | null) => {
+    const children = childrenByParent.get(key) ?? [];
+    children.forEach((child) => {
+      if (ordered.some((item) => item.id === child.id)) {
+        return;
+      }
+      ordered.push(child);
+      visit(child.id);
+    });
+  };
+
+  visit(null);
+  if (ordered.length !== items.length) {
+    const seen = new Set(ordered.map((item) => item.id));
+    items.forEach((item) => {
+      if (!seen.has(item.id)) {
+        ordered.push(item);
+      }
+    });
+  }
+
+  return normalizePositions(ordered);
 }
 
 export function TodoApp() {
   const [todos, setTodos] = useState<TodoRecord[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isAdding, setIsAdding] = useState(false);
-  const [isAddCardActive, setIsAddCardActive] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState("");
   const [showCompleted, setShowCompleted] = useState(true);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
-  const [draggingIds, setDraggingIds] = useState<string[]>([]);
-  const [dragHorizontalIntent, setDragHorizontalIntent] = useState<
-    "nest" | "unnest" | null
-  >(null);
+  const [activeTodoId, setActiveTodoId] = useState<string | null>(null);
+  const [collapsedTodoIds, setCollapsedTodoIds] = useState<string[]>([]);
   const [selectedTodoIds, setSelectedTodoIds] = useState<string[]>([]);
   const [selectionAnchorId, setSelectionAnchorId] = useState<string | null>(null);
-  const [positioningAvailable, setPositioningAvailable] = useState(true);
-  const [isSavingOrder, setIsSavingOrder] = useState(false);
-
-  const latestTodosRef = useRef<TodoRecord[]>([]);
-  const completedToggleRef = useRef<HTMLButtonElement | null>(null);
-  const addCardRowRef = useRef<HTMLElement | null>(null);
-  const todoCardRefs = useRef<Record<string, HTMLElement | null>>({});
-  const todoDoneRefs = useRef<Record<string, HTMLButtonElement | null>>({});
-  const todoTextRefs = useRef<Record<string, HTMLElement | null>>({});
-  const todoMenuRefs = useRef<Record<string, HTMLButtonElement | null>>({});
-  const addCardFieldRef = useRef<HTMLDivElement | null>(null);
-  const skipNextAddBlurSaveRef = useRef(false);
-  const editingFieldRefs = useRef<Record<string, HTMLSpanElement | null>>({});
-  const editingSeedTextRef = useRef("");
-  const skipNextEditBlurSaveRef = useRef(false);
-  const doneCount = useMemo(
-    () => todos.filter((todo) => todo.is_completed).length,
-    [todos],
-  );
-  const filteredTodos = useMemo(
-    () => (showCompleted ? todos : todos.filter((todo) => !todo.is_completed)),
-    [showCompleted, todos],
-  );
-  const depthByTodoId = useMemo(() => {
-    const byId = new Map(todos.map((todo) => [todo.id, todo]));
-    const memo = new Map<string, number>();
-
-    const depthFor = (todoId: string): number => {
-      if (memo.has(todoId)) {
-        return memo.get(todoId) ?? 0;
-      }
-
-      const seen = new Set<string>();
-      let depth = 0;
-      let current = byId.get(todoId);
-      while (current?.parent_id && byId.has(current.parent_id)) {
-        if (seen.has(current.parent_id)) {
-          break;
-        }
-        seen.add(current.parent_id);
-        depth += 1;
-        current = byId.get(current.parent_id);
-      }
-      // If the row has a parent_id but ancestor isn't in the current map,
-      // still render one guide level so nesting remains visible.
-      if (depth === 0 && byId.get(todoId)?.parent_id) {
-        depth = 1;
-      }
-      const boundedDepth = Math.min(depth, 8);
-      memo.set(todoId, boundedDepth);
-      return boundedDepth;
-    };
-
-    const result: Record<string, number> = {};
-    todos.forEach((todo) => {
-      result[todo.id] = depthFor(todo.id);
-    });
-    return result;
-  }, [todos]);
-  const selectedTodoIdSet = useMemo(
-    () => new Set(selectedTodoIds),
-    [selectedTodoIds],
-  );
-
-  const focusAddCardField = useCallback(() => {
-    const field = addCardFieldRef.current;
-    if (!field) {
-      return;
-    }
-
-    field.focus();
-    const range = document.createRange();
-    range.selectNodeContents(field);
-    range.collapse(false);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-  }, []);
-
-  const focusAddCardRow = useCallback(() => {
-    addCardRowRef.current?.focus();
-  }, []);
-
-  const activateAddCardEditor = useCallback(() => {
-    setIsAddCardActive(true);
-    requestAnimationFrame(() => {
-      focusAddCardField();
-    });
-  }, [focusAddCardField]);
-
-  const moveArrowFocus = useCallback(
-    (event: ReactKeyboardEvent<HTMLElement>) => {
-      if (event.key !== "ArrowUp" && event.key !== "ArrowDown") {
-        return false;
-      }
-
-      const target = event.target as HTMLElement;
-      if (target.isContentEditable) {
-        return false;
-      }
-
-      const rail: HTMLElement[] = [
-        completedToggleRef.current,
-        addCardRowRef.current,
-        ...filteredTodos
-          .map((todo) => todoCardRefs.current[todo.id])
-          .filter((element): element is HTMLElement => Boolean(element)),
-      ].filter((element): element is HTMLElement => Boolean(element));
-
-      const current = event.currentTarget as HTMLElement;
-      const index = rail.indexOf(current);
-      if (index === -1) {
-        return false;
-      }
-
-      const delta = event.key === "ArrowDown" ? 1 : -1;
-      const nextIndex = Math.max(0, Math.min(rail.length - 1, index + delta));
-      if (nextIndex === index) {
-        return true;
-      }
-
-      event.preventDefault();
-      rail[nextIndex]?.focus();
-      return true;
-    },
-    [filteredTodos],
-  );
-
-  const moveHorizontalFocusInCard = useCallback(
-    (event: ReactKeyboardEvent<HTMLElement>, todoId: string) => {
-      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") {
-        return false;
-      }
-
-      const target = event.target as HTMLElement;
-      if (target.isContentEditable) {
-        return false;
-      }
-
-      const card = todoCardRefs.current[todoId];
-      const leftToRight: HTMLElement[] = [
-        todoDoneRefs.current[todoId],
-        todoTextRefs.current[todoId],
-        todoMenuRefs.current[todoId],
-      ].filter((element): element is HTMLElement => Boolean(element));
-
-      if (!card || leftToRight.length === 0) {
-        return false;
-      }
-
-      const order =
-        event.key === "ArrowLeft"
-          ? [...leftToRight].reverse().concat(card)
-          : leftToRight.concat(card);
-
-      const current = event.currentTarget as HTMLElement;
-      const index = order.indexOf(current);
-      const nextIndex = index === -1 ? 0 : (index + 1) % order.length;
-
-      event.preventDefault();
-      order[nextIndex]?.focus();
-      return true;
-    },
-    [],
-  );
-
-  const moveShiftSelectionByOffset = useCallback(
-    (focusedTodoId: string, offset: number) => {
-      const focusedIndex = filteredTodos.findIndex(
-        (todo) => todo.id === focusedTodoId,
-      );
-      if (focusedIndex === -1) {
-        return false;
-      }
-
-      const nextIndex = focusedIndex + offset;
-      if (nextIndex < 0 || nextIndex >= filteredTodos.length) {
-        return true;
-      }
-
-      const anchorId = selectionAnchorId ?? focusedTodoId;
-      const anchorIndex = filteredTodos.findIndex((todo) => todo.id === anchorId);
-      if (anchorIndex === -1) {
-        return false;
-      }
-
-      const [start, end] =
-        anchorIndex <= nextIndex
-          ? [anchorIndex, nextIndex]
-          : [nextIndex, anchorIndex];
-      const rangeIds = filteredTodos.slice(start, end + 1).map((todo) => todo.id);
-      setSelectionAnchorId(anchorId);
-      setSelectedTodoIds(rangeIds);
-
-      const nextTodoId = filteredTodos[nextIndex]?.id;
-      if (nextTodoId) {
-        todoCardRefs.current[nextTodoId]?.focus();
-      }
-      return true;
-    },
-    [filteredTodos, selectionAnchorId],
-  );
-
-  useEffect(() => {
-    const handleGlobalKeyDown = (event: KeyboardEvent) => {
-      const key = event.key;
-      const isNavKey =
-        key === "Tab" ||
-        key === "ArrowUp" ||
-        key === "ArrowDown" ||
-        key === "ArrowLeft" ||
-        key === "ArrowRight";
-      const isEnter = key === "Enter";
-
-      if (!isNavKey && !isEnter) {
-        return;
-      }
-
-      const active = document.activeElement as HTMLElement | null;
-      const noFocusedControl =
-        !active || active === document.body || active === document.documentElement;
-
-      if (!noFocusedControl) {
-        return;
-      }
-
-      if (isEnter) {
-        event.preventDefault();
-        activateAddCardEditor();
-        return;
-      }
-
-      event.preventDefault();
-      focusAddCardRow();
-    };
-
-    window.addEventListener("keydown", handleGlobalKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleGlobalKeyDown);
-    };
-  }, [activateAddCardEditor, focusAddCardRow]);
-
-  useEffect(() => {
-    latestTodosRef.current = todos;
-  }, [todos]);
-
-  useEffect(() => {
-    const visibleIds = new Set(filteredTodos.map((todo) => todo.id));
-    setSelectedTodoIds((previous) => previous.filter((id) => visibleIds.has(id)));
-    if (selectionAnchorId && !visibleIds.has(selectionAnchorId)) {
-      setSelectionAnchorId(null);
-    }
-  }, [filteredTodos, selectionAnchorId]);
-
-  useEffect(() => {
-    if (!editingId) {
-      return;
-    }
-
-    const field = editingFieldRefs.current[editingId];
-    if (!field) {
-      return;
-    }
-
-    if (field.textContent !== editingSeedTextRef.current) {
-      field.textContent = editingSeedTextRef.current;
-    }
-
-    field.focus();
-    const range = document.createRange();
-    range.selectNodeContents(field);
-    const selection = window.getSelection();
-    selection?.removeAllRanges();
-    selection?.addRange(range);
-  }, [editingId]);
-
-  useEffect(() => {
-    if (!isAddCardActive) {
-      return;
-    }
-
-    const field = addCardFieldRef.current;
-    if (!field) {
-      return;
-    }
-
-    if (field.textContent !== newTitle) {
-      field.textContent = newTitle;
-    }
-
-    focusAddCardField();
-  }, [focusAddCardField, isAddCardActive, newTitle]);
+  const cardRef = useRef<HTMLDivElement | null>(null);
+  const newTaskInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const taskTextareaRefs = useRef<Record<string, HTMLTextAreaElement | null>>({});
 
   const loadTodos = useCallback(async () => {
     if (!hasSupabaseEnv) {
@@ -476,7 +178,6 @@ export function TodoApp() {
       setError(null);
       const rows = await listTodos();
       setTodos(normalizePositions(rows));
-      setPositioningAvailable(isPositioningEnabled());
     } catch (loadError) {
       setError(
         loadError instanceof Error
@@ -492,295 +193,160 @@ export function TodoApp() {
     void loadTodos();
   }, [loadTodos]);
 
-  const canReorder =
-    hasSupabaseEnv &&
-    showCompleted &&
-    !editingId &&
-    !busyId &&
-    positioningAvailable;
+  const handleDeleteSelection = useCallback(async () => {
+    const targetIds = selectedTodoIds.length
+      ? selectedTodoIds
+      : activeTodoId && activeTodoId !== NEW_TASK_ACTIVE_ID
+        ? [activeTodoId]
+        : [];
 
-  const persistCurrentOrder = useCallback(async () => {
-    if (!positioningAvailable) {
+    if (
+      !hasSupabaseEnv ||
+      !targetIds.length ||
+      busyId
+    ) {
       return;
     }
 
+    const previousTodos = todos;
+    const nextTodos = normalizePositions(
+      previousTodos.filter((item) => !targetIds.includes(item.id)),
+    );
+
     try {
-      setIsSavingOrder(true);
-      await updateTodoPositions(latestTodosRef.current.map((todo) => todo.id));
-    } catch (saveOrderError) {
-      setError(
-        saveOrderError instanceof Error
-          ? saveOrderError.message
-          : "Failed to persist task order.",
-      );
-    } finally {
-      setIsSavingOrder(false);
-    }
-  }, [positioningAvailable]);
-
-  const moveFocusedSelectionByOffset = useCallback(
-    async (activeId: string, offset: -1 | 1) => {
-      if (!canReorder) {
-        return;
-      }
-
-      const selectedForAction =
-        selectedTodoIds.length > 0 && selectedTodoIds.includes(activeId)
-          ? selectedTodoIds
-          : [];
-      const movedIds = selectedForAction.length > 0 ? selectedForAction : [activeId];
-
-      const snapshot = latestTodosRef.current;
-      const moved = compactAndMoveSelection(
-        snapshot,
-        selectedForAction,
-        activeId,
-        offset,
-      );
-      if (!moved.changed) {
-        return;
-      }
-
-      const normalized = normalizeMovedParentsAfterReorder(moved.next, movedIds);
-      latestTodosRef.current = normalized.next;
-      setTodos(normalized.next);
-
-      try {
-        setError(null);
-        await Promise.all([
-          persistCurrentOrder(),
-          ...normalized.parentUpdates.map(async (update) => {
-            await updateTodo(update.id, { parent_id: update.parent_id });
-          }),
-        ]);
-        requestAnimationFrame(() => {
-          todoCardRefs.current[activeId]?.focus();
-        });
-      } catch (reorderError) {
-        latestTodosRef.current = snapshot;
-        setTodos(snapshot);
-        setError(
-          reorderError instanceof Error
-            ? reorderError.message
-            : "Failed to move and reparent todo items.",
-        );
-      }
-    },
-    [canReorder, persistCurrentOrder, selectedTodoIds],
-  );
-
-  const nestFocusedSelectionIntoPrevious = useCallback(
-    async (activeId: string) => {
-      if (!hasSupabaseEnv || busyId || editingId) {
-        return;
-      }
-
-      const snapshot = latestTodosRef.current;
-      const selectedForAction =
-        selectedTodoIds.length > 0 &&
-        selectedTodoIds.includes(activeId)
-          ? selectedTodoIds
-          : [];
-      const compacted = compactSelectionAtAnchor(
-        snapshot,
-        selectedForAction,
-        activeId,
-      );
-      if (!compacted) {
-        return;
-      }
-
-      if (compacted.anchorIndex === 0) {
-        return;
-      }
-
-      const parent = compacted.compacted[compacted.anchorIndex - 1];
-      if (!parent) {
-        return;
-      }
-
-      const blockIds = compacted.block.map((todo) => todo.id);
-      const parentLevelId = parent.parent_id;
-      const shouldNestIntoParent =
-        Boolean(parentLevelId) &&
-        compacted.block.every((todo) => todo.parent_id === parentLevelId);
-      const nextParentIdForBlock: string | null = parentLevelId
-        ? shouldNestIntoParent
-          ? parent.id
-          : parentLevelId
-        : parent.id;
-      const next = normalizePositions(
-        compacted.compacted.map((todo) => {
-          if (!blockIds.includes(todo.id)) {
-            return todo;
-          }
-
-          return { ...todo, parent_id: nextParentIdForBlock };
-        }),
-      );
-
-      const changed = next.some((todo, index) => {
-        const previous = snapshot[index];
-        return (
-          todo.id !== previous?.id || todo.parent_id !== previous?.parent_id
-        );
-      });
-      if (!changed) {
-        return;
-      }
-
-      setTodos(next);
-
-      try {
-        setError(null);
-        await Promise.all(
-          blockIds.map(async (todoId) => {
-            const updatedTodo = next.find((todo) => todo.id === todoId);
-            await updateTodo(todoId, { parent_id: updatedTodo?.parent_id ?? null });
-          }),
-        );
-        await persistCurrentOrder();
-      } catch (nestError) {
-        setTodos(snapshot);
-        setError(
-          nestError instanceof Error
-            ? nestError.message
-            : "Failed to nest the selected todo items.",
-        );
-      }
-    },
-    [busyId, editingId, persistCurrentOrder, selectedTodoIds],
-  );
-
-  const unnestFocusedSelectionOneLevel = useCallback(
-    async (activeId: string) => {
-      if (!hasSupabaseEnv || busyId || editingId) {
-        return;
-      }
-
-      const snapshot = latestTodosRef.current;
-      const byId = new Map(snapshot.map((todo) => [todo.id, todo]));
-      const targetIds =
-        selectedTodoIds.length > 0 && selectedTodoIds.includes(activeId)
-          ? selectedTodoIds
-          : [activeId];
-
-      const updates = targetIds
-        .map((todoId) => {
-          const todo = byId.get(todoId);
-          if (!todo?.parent_id) {
-            return null;
-          }
-          const parent = byId.get(todo.parent_id);
-          const nextParentId = parent?.parent_id ?? null;
-          if (nextParentId === todo.parent_id) {
-            return null;
-          }
-          return { id: todoId, parent_id: nextParentId };
-        })
-        .filter(
-          (
-            value,
-          ): value is {
-            id: string;
-            parent_id: string | null;
-          } => Boolean(value),
-        );
-
-      if (updates.length === 0) {
-        return;
-      }
-
-      const updateMap = new Map(updates.map((item) => [item.id, item.parent_id]));
-      const next = snapshot.map((todo) =>
-        updateMap.has(todo.id)
-          ? { ...todo, parent_id: updateMap.get(todo.id) ?? null }
-          : todo,
-      );
-      setTodos(next);
-
-      try {
-        setError(null);
-        await Promise.all(
-          updates.map(async (item) => {
-            await updateTodo(item.id, { parent_id: item.parent_id });
-          }),
-        );
-      } catch (unnestError) {
-        setTodos(snapshot);
-        setError(
-          unnestError instanceof Error
-            ? unnestError.message
-            : "Failed to unnest the selected todo items.",
-        );
-      }
-    },
-    [busyId, editingId, selectedTodoIds],
-  );
-
-  const deleteFocusedSelection = useCallback(
-    async (activeId: string) => {
-      if (!hasSupabaseEnv || busyId || editingId) {
-        return;
-      }
-
-      const snapshot = latestTodosRef.current;
-      const targetIds = Array.from(
-        new Set(
-          selectedTodoIds.length > 0 && selectedTodoIds.includes(activeId)
-            ? selectedTodoIds
-            : [activeId],
-        ),
-      );
-      if (targetIds.length === 0) {
-        return;
-      }
-
-      const activeIndex = snapshot.findIndex((todo) => todo.id === activeId);
-      const nextTodos = normalizePositions(
-        snapshot.filter((todo) => !targetIds.includes(todo.id)),
-      );
-
-      latestTodosRef.current = nextTodos;
+      setError(null);
+      setBusyId(MULTI_BUSY_ID);
       setTodos(nextTodos);
+      await Promise.all(targetIds.map(async (id) => deleteTodo(id)));
+      await updateTodoPositions(nextTodos.map((item) => item.id));
+      if (editingId && targetIds.includes(editingId)) {
+        setEditingId(null);
+        setEditingTitle("");
+      }
+      setActiveTodoId(null);
       setSelectedTodoIds([]);
       setSelectionAnchorId(null);
-      setBusyId("__bulk_delete__");
+    } catch (deleteError) {
+      setTodos(previousTodos);
+      setError(
+        deleteError instanceof Error
+          ? deleteError.message
+          : "Failed to delete the todo.",
+      );
+    } finally {
+      setBusyId(null);
+    }
+  }, [activeTodoId, busyId, editingId, selectedTodoIds, todos]);
 
-      try {
-        setError(null);
-        await Promise.all(targetIds.map(async (todoId) => deleteTodo(todoId)));
-        await persistCurrentOrder();
-
-        requestAnimationFrame(() => {
-          if (nextTodos.length === 0) {
-            return;
-          }
-          const focusIndex = Math.min(
-            Math.max(activeIndex, 0),
-            nextTodos.length - 1,
-          );
-          const nextFocusId = nextTodos[focusIndex]?.id;
-          if (nextFocusId) {
-            todoCardRefs.current[nextFocusId]?.focus();
-          }
-        });
-      } catch (deleteError) {
-        latestTodosRef.current = snapshot;
-        setTodos(snapshot);
-        setError(
-          deleteError instanceof Error
-            ? deleteError.message
-            : "Failed to delete focused todo items.",
-        );
-      } finally {
-        setBusyId(null);
-      }
-    },
-    [busyId, editingId, persistCurrentOrder, selectedTodoIds],
+  const doneCount = useMemo(
+    () => todos.filter((todo) => todo.is_completed).length,
+    [todos],
   );
 
-  const handleCreateFromAddCard = async () => {
+  const depthByTodoId = useMemo(() => buildDepthMap(todos), [todos]);
+
+  const filteredTodos = useMemo(
+    () => (showCompleted ? todos : todos.filter((todo) => !todo.is_completed)),
+    [showCompleted, todos],
+  );
+  const collapsedTodoIdSet = useMemo(
+    () => new Set(collapsedTodoIds),
+    [collapsedTodoIds],
+  );
+  const hasChildrenTodoIdSet = useMemo(() => {
+    const parentIds = new Set<string>();
+    todos.forEach((todo) => {
+      if (todo.parent_id) {
+        parentIds.add(todo.parent_id);
+      }
+    });
+    return parentIds;
+  }, [todos]);
+  const visibleTodos = useMemo(() => {
+    const byId = new Map(filteredTodos.map((todo) => [todo.id, todo]));
+    return filteredTodos.filter((todo) => {
+      let parentId = todo.parent_id;
+      while (parentId) {
+        if (collapsedTodoIdSet.has(parentId)) {
+          return false;
+        }
+        const parent = byId.get(parentId);
+        if (!parent) {
+          break;
+        }
+        parentId = parent.parent_id;
+      }
+      return true;
+    });
+  }, [collapsedTodoIdSet, filteredTodos]);
+  const selectedTodoIdSet = useMemo(
+    () => new Set(selectedTodoIds),
+    [selectedTodoIds],
+  );
+
+  useEffect(() => {
+    const visibleIds = new Set(filteredTodos.map((todo) => todo.id));
+    setSelectedTodoIds((previous) => previous.filter((id) => visibleIds.has(id)));
+    setSelectionAnchorId((previous) =>
+      previous && visibleIds.has(previous) ? previous : null,
+    );
+    if (
+      activeTodoId &&
+      activeTodoId !== NEW_TASK_ACTIVE_ID &&
+      !visibleIds.has(activeTodoId)
+    ) {
+      setActiveTodoId(null);
+    }
+  }, [activeTodoId, filteredTodos]);
+
+  useEffect(() => {
+    setCollapsedTodoIds((previous) =>
+      previous.filter((id) => hasChildrenTodoIdSet.has(id)),
+    );
+  }, [hasChildrenTodoIdSet]);
+
+  useEffect(() => {
+    const visibleIds = new Set(visibleTodos.map((todo) => todo.id));
+    setSelectedTodoIds((previous) => previous.filter((id) => visibleIds.has(id)));
+    setSelectionAnchorId((previous) =>
+      previous && visibleIds.has(previous) ? previous : null,
+    );
+    if (
+      activeTodoId &&
+      activeTodoId !== NEW_TASK_ACTIVE_ID &&
+      !visibleIds.has(activeTodoId)
+    ) {
+      setActiveTodoId(null);
+    }
+  }, [activeTodoId, visibleTodos]);
+
+  useEffect(() => {
+    resizeTextarea(newTaskInputRef.current);
+  }, [newTitle]);
+
+  useEffect(() => {
+    visibleTodos.forEach((todo) => {
+      resizeTextarea(taskTextareaRefs.current[todo.id] ?? null);
+    });
+  }, [visibleTodos, editingId, editingTitle]);
+
+  useEffect(() => {
+    if (!editingId) {
+      return;
+    }
+    const element = taskTextareaRefs.current[editingId];
+    if (!element) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      element.focus();
+      element.setSelectionRange(0, element.value.length);
+      resizeTextarea(element);
+    });
+  }, [editingId]);
+
+  const submitNewTask = useCallback(async () => {
     if (!hasSupabaseEnv || isAdding) {
       return;
     }
@@ -793,11 +359,11 @@ export function TodoApp() {
     try {
       setError(null);
       setIsAdding(true);
-      const position = latestTodosRef.current.length;
-      const created = await createTodo(title, position);
+      const created = await createTodo(title, todos.length);
       setTodos((previous) => normalizePositions([...previous, created]));
       setNewTitle("");
-      setIsAddCardActive(false);
+      setActiveTodoId(NEW_TASK_ACTIVE_ID);
+      newTaskInputRef.current?.blur();
     } catch (createError) {
       setError(
         createError instanceof Error
@@ -807,23 +373,444 @@ export function TodoApp() {
     } finally {
       setIsAdding(false);
     }
-  };
+  }, [isAdding, newTitle, todos.length]);
+
+  const handleNestActiveTodo = useCallback(async () => {
+    const targetIds = selectedTodoIds.length
+      ? selectedTodoIds
+      : activeTodoId && activeTodoId !== NEW_TASK_ACTIVE_ID
+        ? [activeTodoId]
+        : [];
+
+    if (
+      !hasSupabaseEnv ||
+      !targetIds.length ||
+      busyId ||
+      editingId
+    ) {
+      return;
+    }
+
+    const visibleOrder = visibleTodos.map((todo) => todo.id);
+    const orderedTargetIds = [...targetIds].sort(
+      (a, b) => visibleOrder.indexOf(a) - visibleOrder.indexOf(b),
+    );
+    const previousTodos = todos;
+    let workingTodos = previousTodos;
+    const updates: Array<{ id: string; parent_id: string | null }> = [];
+
+    orderedTargetIds.forEach((id) => {
+      const visible = visibleOrder
+        .map((visibleId) => workingTodos.find((todo) => todo.id === visibleId))
+        .filter((todo): todo is TodoRecord => Boolean(todo));
+      const index = visible.findIndex((todo) => todo.id === id);
+      if (index <= 0) {
+        return;
+      }
+
+      const parent = visible[index - 1];
+      const current = visible[index];
+      if (!parent || !current) {
+        return;
+      }
+
+      const depthMap = buildDepthMap(workingTodos);
+      const currentDepth = depthMap[current.id] ?? 0;
+      const parentDepth = depthMap[parent.id] ?? 0;
+      const nextParentId =
+        currentDepth < parentDepth ? parent.parent_id ?? null : parent.id;
+
+      if (current.parent_id === nextParentId) {
+        return;
+      }
+
+      updates.push({ id: current.id, parent_id: nextParentId });
+      workingTodos = workingTodos.map((item) =>
+        item.id === current.id ? { ...item, parent_id: nextParentId } : item,
+      );
+    });
+
+    if (!updates.length) {
+      return;
+    }
+
+    try {
+      setError(null);
+      setBusyId(MULTI_BUSY_ID);
+      setTodos(workingTodos);
+      await Promise.all(
+        updates.map(async ({ id, parent_id }) => updateTodo(id, { parent_id })),
+      );
+    } catch (nestError) {
+      setTodos(previousTodos);
+      setError(
+        nestError instanceof Error ? nestError.message : "Failed to nest the todo.",
+      );
+    } finally {
+      setBusyId(null);
+    }
+  }, [activeTodoId, busyId, editingId, selectedTodoIds, todos, visibleTodos]);
+
+  const handleUnnestActiveTodo = useCallback(async () => {
+    const targetIds = selectedTodoIds.length
+      ? selectedTodoIds
+      : activeTodoId && activeTodoId !== NEW_TASK_ACTIVE_ID
+        ? [activeTodoId]
+        : [];
+
+    if (
+      !hasSupabaseEnv ||
+      !targetIds.length ||
+      busyId ||
+      editingId
+    ) {
+      return;
+    }
+
+    const visibleOrder = visibleTodos.map((todo) => todo.id);
+    const orderedTargetIds = [...targetIds].sort(
+      (a, b) => visibleOrder.indexOf(a) - visibleOrder.indexOf(b),
+    );
+    const previousTodos = todos;
+    let workingTodos = previousTodos;
+    const updates: Array<{ id: string; parent_id: string | null }> = [];
+
+    orderedTargetIds.forEach((id) => {
+      const visible = visibleOrder
+        .map((visibleId) => workingTodos.find((todo) => todo.id === visibleId))
+        .filter((todo): todo is TodoRecord => Boolean(todo));
+      const current = visible.find((todo) => todo.id === id);
+      if (!current?.parent_id) {
+        return;
+      }
+
+      const currentIndex = visible.findIndex((todo) => todo.id === id);
+      const above = currentIndex > 0 ? visible[currentIndex - 1] : null;
+      const depthMap = buildDepthMap(workingTodos);
+      const currentDepth = depthMap[current.id] ?? 0;
+      const aboveDepth = above ? (depthMap[above.id] ?? 0) : -1;
+      const directParent = workingTodos.find((todo) => todo.id === current.parent_id);
+      const oneLevelUpParentId = directParent?.parent_id ?? null;
+      const alignWithAboveParentId = above ? (above.parent_id ?? null) : null;
+      const nextParentId =
+        above && currentDepth > aboveDepth ? alignWithAboveParentId : oneLevelUpParentId;
+
+      if (nextParentId === current.parent_id) {
+        return;
+      }
+
+      updates.push({ id: current.id, parent_id: nextParentId });
+      workingTodos = workingTodos.map((item) =>
+        item.id === current.id ? { ...item, parent_id: nextParentId } : item,
+      );
+    });
+
+    if (!updates.length) {
+      return;
+    }
+
+    try {
+      setError(null);
+      setBusyId(MULTI_BUSY_ID);
+      setTodos(workingTodos);
+      await Promise.all(
+        updates.map(async ({ id, parent_id }) => updateTodo(id, { parent_id })),
+      );
+    } catch (unnestError) {
+      setTodos(previousTodos);
+      setError(
+        unnestError instanceof Error
+          ? unnestError.message
+          : "Failed to unnest the todo.",
+      );
+    } finally {
+      setBusyId(null);
+    }
+  }, [activeTodoId, busyId, editingId, selectedTodoIds, todos, visibleTodos]);
+
+  const handleMoveActiveTodo = useCallback(
+    async (direction: -1 | 1) => {
+      if (
+        !hasSupabaseEnv ||
+        !activeTodoId ||
+        activeTodoId === NEW_TASK_ACTIVE_ID ||
+        busyId ||
+        editingId
+      ) {
+        return;
+      }
+
+      const previousTodos = todos;
+      const reordered = reorderBySiblingMove(previousTodos, activeTodoId, direction);
+      if (!reordered) {
+        return;
+      }
+
+      try {
+        setError(null);
+        setBusyId(activeTodoId);
+        setTodos(reordered);
+        await updateTodoPositions(reordered.map((item) => item.id));
+      } catch (moveError) {
+        setTodos(previousTodos);
+        setError(
+          moveError instanceof Error
+            ? moveError.message
+            : "Failed to reorder todos.",
+        );
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [activeTodoId, busyId, editingId, todos],
+  );
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (isTypingTarget(event.target)) {
+          return;
+        }
+        setActiveTodoId(null);
+        setSelectedTodoIds([]);
+        setSelectionAnchorId(null);
+        return;
+      }
+
+      if (
+        (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+        event.shiftKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !editingId &&
+        !isTypingTarget(event.target)
+      ) {
+        if (!visibleTodos.length) {
+          return;
+        }
+
+        event.preventDefault();
+        const visibleIds = visibleTodos.map((todo) => todo.id);
+        const direction = event.key === "ArrowUp" ? -1 : 1;
+        const initialIndex = visibleIds.indexOf(activeTodoId ?? "");
+        const currentIndex =
+          initialIndex === -1 ? (direction < 0 ? visibleIds.length - 1 : 0) : initialIndex;
+        const nextIndex = Math.max(
+          0,
+          Math.min(visibleIds.length - 1, currentIndex + direction),
+        );
+        const nextId = visibleIds[nextIndex];
+        const anchorId =
+          selectionAnchorId && visibleIds.includes(selectionAnchorId)
+            ? selectionAnchorId
+            : visibleIds[currentIndex];
+        const anchorIndex = visibleIds.indexOf(anchorId);
+        const start = Math.min(anchorIndex, nextIndex);
+        const end = Math.max(anchorIndex, nextIndex);
+        const range = visibleIds.slice(start, end + 1);
+
+        setActiveTodoId(nextId);
+        setSelectionAnchorId(anchorId);
+        setSelectedTodoIds(range);
+        return;
+      }
+
+      if (
+        (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+        event.metaKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !editingId &&
+        !isTypingTarget(event.target)
+      ) {
+        event.preventDefault();
+        void handleMoveActiveTodo(event.key === "ArrowUp" ? -1 : 1);
+        return;
+      }
+
+      if (
+        (event.key === "ArrowUp" || event.key === "ArrowDown") &&
+        !editingId &&
+        !isTypingTarget(event.target)
+      ) {
+        event.preventDefault();
+        const isMultiSelecting =
+          selectedTodoIds.length > 1 &&
+          Boolean(selectionAnchorId) &&
+          selectionAnchorId !== NEW_TASK_ACTIVE_ID;
+        const navigationBaseId = isMultiSelecting
+          ? selectionAnchorId
+          : activeTodoId;
+
+        setSelectedTodoIds([]);
+        setSelectionAnchorId(null);
+        if (!visibleTodos.length) {
+          setActiveTodoId(NEW_TASK_ACTIVE_ID);
+          return;
+        }
+
+        const currentIndex = visibleTodos.findIndex(
+          (todo) => todo.id === navigationBaseId,
+        );
+
+        if (event.key === "ArrowUp") {
+          if (currentIndex === -1) {
+            if (!navigationBaseId) {
+              setActiveTodoId(NEW_TASK_ACTIVE_ID);
+              return;
+            }
+            if (navigationBaseId === NEW_TASK_ACTIVE_ID) {
+              setActiveTodoId(visibleTodos[visibleTodos.length - 1].id);
+              return;
+            }
+            setActiveTodoId(visibleTodos[0].id);
+            return;
+          }
+          const nextIndex = Math.max(0, currentIndex - 1);
+          setActiveTodoId(visibleTodos[nextIndex].id);
+          return;
+        }
+
+        if (currentIndex === -1) {
+          if (!navigationBaseId) {
+            setActiveTodoId(visibleTodos[0].id);
+            return;
+          }
+          if (navigationBaseId === NEW_TASK_ACTIVE_ID) {
+            return;
+          }
+          setActiveTodoId(visibleTodos[visibleTodos.length - 1].id);
+          return;
+        }
+        if (currentIndex === visibleTodos.length - 1) {
+          setActiveTodoId(NEW_TASK_ACTIVE_ID);
+          return;
+        }
+        const nextIndex = currentIndex + 1;
+        setActiveTodoId(visibleTodos[nextIndex].id);
+        return;
+      }
+
+      if (
+        event.key === "ArrowRight" &&
+        event.metaKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !editingId &&
+        !isTypingTarget(event.target)
+      ) {
+        event.preventDefault();
+        void handleNestActiveTodo();
+        return;
+      }
+
+      if (
+        event.key === "ArrowLeft" &&
+        event.metaKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !editingId &&
+        !isTypingTarget(event.target)
+      ) {
+        event.preventDefault();
+        void handleUnnestActiveTodo();
+        return;
+      }
+
+      if (
+        hasSupabaseEnv &&
+        (!activeTodoId || activeTodoId === NEW_TASK_ACTIVE_ID) &&
+        !editingId &&
+        !isTypingTarget(event.target) &&
+        event.key.length === 1 &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey
+      ) {
+        event.preventDefault();
+        newTaskInputRef.current?.focus();
+        setNewTitle((previous) => `${previous}${event.key}`);
+        return;
+      }
+
+      if (
+        (event.key === "Backspace" || event.key === "Delete") &&
+        (selectedTodoIds.length > 0 ||
+          (activeTodoId && activeTodoId !== NEW_TASK_ACTIVE_ID)) &&
+        !editingId &&
+        !isTypingTarget(event.target)
+      ) {
+        event.preventDefault();
+        void handleDeleteSelection();
+      }
+    };
+
+    const handlePointerDown = (event: MouseEvent | TouchEvent) => {
+      const target = event.target as Node | null;
+      if (!target) {
+        return;
+      }
+      if (!cardRef.current?.contains(target)) {
+        setActiveTodoId(null);
+        setSelectedTodoIds([]);
+        setSelectionAnchorId(null);
+      }
+    };
+
+    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("mousedown", handlePointerDown);
+    document.addEventListener("touchstart", handlePointerDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("mousedown", handlePointerDown);
+      document.removeEventListener("touchstart", handlePointerDown);
+    };
+  }, [
+    activeTodoId,
+    editingId,
+    visibleTodos,
+    handleDeleteSelection,
+    handleMoveActiveTodo,
+    handleNestActiveTodo,
+    handleUnnestActiveTodo,
+    selectedTodoIds.length,
+    selectionAnchorId,
+  ]);
+
+  const toggleCollapsedTodo = useCallback((todoId: string) => {
+    setCollapsedTodoIds((previous) =>
+      previous.includes(todoId)
+        ? previous.filter((id) => id !== todoId)
+        : [...previous, todoId],
+    );
+  }, []);
 
   const handleToggle = async (todo: TodoRecord) => {
     if (!hasSupabaseEnv || busyId) {
       return;
     }
 
+    const nextCompleted = !todo.is_completed;
+
     try {
       setError(null);
       setBusyId(todo.id);
-      const updated = await updateTodo(todo.id, {
-        is_completed: !todo.is_completed,
-      });
+      setTodos((previous) =>
+        previous.map((item) =>
+          item.id === todo.id ? { ...item, is_completed: nextCompleted } : item,
+        ),
+      );
+
+      const updated = await updateTodo(todo.id, { is_completed: nextCompleted });
       setTodos((previous) =>
         previous.map((item) => (item.id === updated.id ? updated : item)),
       );
     } catch (updateError) {
+      setTodos((previous) =>
+        previous.map((item) =>
+          item.id === todo.id ? { ...item, is_completed: todo.is_completed } : item,
+        ),
+      );
       setError(
         updateError instanceof Error
           ? updateError.message
@@ -835,7 +822,6 @@ export function TodoApp() {
   };
 
   const startEdit = (todo: TodoRecord) => {
-    editingSeedTextRef.current = todo.title;
     setEditingId(todo.id);
     setEditingTitle(todo.title);
   };
@@ -850,33 +836,15 @@ export function TodoApp() {
       return;
     }
 
-    const targetId = editingId;
     const title = editingTitle.trim();
     if (!title) {
-      try {
-        setError(null);
-        setBusyId(targetId);
-        await deleteTodo(targetId);
-        setTodos((previous) =>
-          normalizePositions(previous.filter((item) => item.id !== targetId)),
-        );
-        cancelEdit();
-      } catch (deleteError) {
-        setError(
-          deleteError instanceof Error
-            ? deleteError.message
-            : "Failed to delete the todo.",
-        );
-      } finally {
-        setBusyId(null);
-      }
       return;
     }
 
     try {
       setError(null);
-      setBusyId(targetId);
-      const updated = await updateTodo(targetId, { title });
+      setBusyId(editingId);
+      const updated = await updateTodo(editingId, { title });
       setTodos((previous) =>
         previous.map((item) => (item.id === updated.id ? updated : item)),
       );
@@ -892,277 +860,71 @@ export function TodoApp() {
     }
   };
 
-  const startDrag = (
-    activeId: string,
-    dragPointerId: number,
-    dragStartX: number,
-  ) => {
-    if (!canReorder) {
+  const handleEditKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void saveEdit();
       return;
     }
-
-    const previewIds =
-      selectedTodoIds.length > 0 && selectedTodoIds.includes(activeId)
-        ? selectedTodoIds
-        : [activeId];
-
-    setError(null);
-    setDraggingIds(previewIds);
-    setDragHorizontalIntent(null);
-
-    let moved = false;
-    let latestClientX = dragStartX;
-
-    document.body.style.userSelect = "none";
-    document.body.style.touchAction = "none";
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      if (moveEvent.pointerId !== dragPointerId) {
-        return;
-      }
-
-      moveEvent.preventDefault();
-      latestClientX = moveEvent.clientX;
-      const deltaX = latestClientX - dragStartX;
-      if (deltaX >= CARD_HORIZONTAL_NEST_PX) {
-        setDragHorizontalIntent("nest");
-      } else if (deltaX <= -CARD_HORIZONTAL_NEST_PX) {
-        setDragHorizontalIntent("unnest");
-      } else {
-        setDragHorizontalIntent(null);
-      }
-      const target = document
-        .elementFromPoint(moveEvent.clientX, moveEvent.clientY)
-        ?.closest<HTMLElement>("[data-todo-id]");
-
-      const overId = target?.dataset.todoId;
-      if (!overId || overId === activeId) {
-        return;
-      }
-
-      setTodos((previous) => {
-        const fromIndex = previous.findIndex((todo) => todo.id === activeId);
-        const toIndex = previous.findIndex((todo) => todo.id === overId);
-        if (fromIndex === -1 || toIndex === -1 || fromIndex === toIndex) {
-          return previous;
-        }
-        moved = true;
-        return normalizePositions(arrayMove(previous, fromIndex, toIndex));
-      });
-    };
-
-    const cleanup = () => {
-      document.body.style.userSelect = "";
-      document.body.style.touchAction = "";
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", handlePointerUp);
-      setDraggingIds([]);
-      setDragHorizontalIntent(null);
-    };
-
-    const handlePointerUp = async (upEvent: PointerEvent) => {
-      if (upEvent.pointerId !== dragPointerId) {
-        return;
-      }
-
-      cleanup();
-      const deltaX = latestClientX - dragStartX;
-      const shouldNest = deltaX >= CARD_HORIZONTAL_NEST_PX;
-      const shouldUnnest = deltaX <= -CARD_HORIZONTAL_NEST_PX;
-
-      if (moved && positioningAvailable) {
-        await persistCurrentOrder();
-      }
-
-      if (shouldNest) {
-        await nestFocusedSelectionIntoPrevious(activeId);
-      } else if (shouldUnnest) {
-        await unnestFocusedSelectionOneLevel(activeId);
-      }
-    };
-
-    window.addEventListener("pointermove", handlePointerMove, {
-      passive: false,
-    });
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", handlePointerUp);
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEdit();
+    }
   };
 
-  const handleCardPointerDown = (
-    event: ReactPointerEvent<HTMLElement>,
-    todo: TodoRecord,
+  const handleNewTaskKeyDown = (
+    event: React.KeyboardEvent<HTMLTextAreaElement>,
   ) => {
-    const target = event.target as HTMLElement;
-    if (
-      target.closest(
-        "button, input, textarea, select, a, [contenteditable='true']",
-      )
-    ) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      void submitNewTask();
       return;
     }
 
-    event.preventDefault();
-
-    const pointerId = event.pointerId;
-    const isShiftSelection = event.shiftKey;
-    const startX = event.clientX;
-    const startY = event.clientY;
-    let dragStarted = false;
-    let allowEditOnRelease = true;
-
-    const cleanup = () => {
-      window.clearTimeout(holdTimer);
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
-      window.removeEventListener("pointercancel", handlePointerCancel);
-    };
-
-    const handlePointerMove = (moveEvent: PointerEvent) => {
-      if (moveEvent.pointerId !== pointerId) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (newTitle.length > 0) {
+        setNewTitle("");
+        setActiveTodoId(NEW_TASK_ACTIVE_ID);
+        event.currentTarget.blur();
         return;
       }
-
-      const deltaX = Math.abs(moveEvent.clientX - startX);
-      const deltaY = Math.abs(moveEvent.clientY - startY);
-      if (deltaX > CARD_MOVE_CANCEL_PX || deltaY > CARD_MOVE_CANCEL_PX) {
-        allowEditOnRelease = false;
-      }
-    };
-
-    const handlePointerUp = (upEvent: PointerEvent) => {
-      if (upEvent.pointerId !== pointerId) {
-        return;
-      }
-
-      cleanup();
-      if (dragStarted) {
-        return;
-      }
-
-      if (!allowEditOnRelease) {
-        return;
-      }
-
-      if (isShiftSelection) {
-        const focusedTodoId =
-          (document.activeElement as HTMLElement | null)?.dataset?.todoId ?? null;
-        const next = new Set(selectedTodoIds);
-        if (next.size === 0 && focusedTodoId) {
-          next.add(focusedTodoId);
-        }
-
-        const isRemoving = next.has(todo.id);
-        if (isRemoving) {
-          next.delete(todo.id);
-        } else {
-          next.add(todo.id);
-        }
-
-        const nextSelected = Array.from(next);
-        setSelectedTodoIds(nextSelected);
-        setSelectionAnchorId(nextSelected.length ? todo.id : null);
-
-        if (isRemoving) {
-          if (nextSelected.length === 0) {
-            todoCardRefs.current[todo.id]?.blur();
-          } else {
-            todoCardRefs.current[nextSelected[0]]?.focus();
-          }
-        } else {
-          todoCardRefs.current[todo.id]?.focus();
-        }
-        return;
-      }
-
-      setSelectedTodoIds([todo.id]);
-      setSelectionAnchorId(todo.id);
-      todoCardRefs.current[todo.id]?.focus();
-    };
-
-    const handlePointerCancel = (cancelEvent: PointerEvent) => {
-      if (cancelEvent.pointerId !== pointerId) {
-        return;
-      }
-
-      cleanup();
-    };
-
-    const holdTimer = window.setTimeout(() => {
-      if (!canReorder) {
-        return;
-      }
-
-      dragStarted = true;
-      allowEditOnRelease = false;
-      startDrag(todo.id, pointerId, startX);
-    }, CARD_HOLD_TO_DRAG_MS);
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-    window.addEventListener("pointercancel", handlePointerCancel);
-  };
-
-  const handleCardDoubleClick = (
-    event: React.MouseEvent<HTMLElement>,
-    todo: TodoRecord,
-  ) => {
-    const target = event.target as HTMLElement;
-    if (
-      target.closest(
-        "button, input, textarea, select, a, [contenteditable='true']",
-      )
-    ) {
-      return;
+      setActiveTodoId(null);
+      event.currentTarget.blur();
     }
-
-    if (!hasSupabaseEnv || busyId || editingId) {
-      return;
-    }
-
-    setSelectedTodoIds([]);
-    setSelectionAnchorId(null);
-    startEdit(todo);
   };
 
   return (
     <main className="safe-area-shell">
       <div className="mx-auto w-full max-w-2xl">
-        <Card>
+        <Card ref={cardRef} className="select-none">
           <CardHeader className="pb-4">
             <div className="flex items-center justify-between gap-3">
               <p className="text-xs uppercase tracking-[0.26em] text-muted-foreground">
                 Nest
               </p>
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <button
-                  type="button"
-                  ref={completedToggleRef}
-                  onClick={() => setShowCompleted((previous) => !previous)}
-                  onKeyDown={(event) => {
-                    void moveArrowFocus(event);
-                  }}
-                  aria-pressed={showCompleted}
-                  title={showCompleted ? "Hide completed tasks" : "Show completed tasks"}
-                >
-                  {doneCount}/{todos.length} Completed ({showCompleted ? "Hide" : "Show"})
-                </button>
-                {isSavingOrder && <span>Saving order...</span>}
-              </div>
+              <button
+                type="button"
+                onClick={() => setShowCompleted((previous) => !previous)}
+                aria-pressed={showCompleted}
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground"
+                title={showCompleted ? "Hide completed tasks" : "Show completed tasks"}
+              >
+                {doneCount}/{todos.length} Completed
+                {showCompleted ? (
+                  <Eye className="h-3.5 w-3.5" aria-hidden="true" />
+                ) : (
+                  <EyeOff className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+              </button>
             </div>
           </CardHeader>
-          <CardContent className="space-y-4">
+
+          <CardContent className="space-y-0 select-none">
             {!hasSupabaseEnv && (
               <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-200">
                 Add <code>NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
                 <code>NEXT_PUBLIC_SUPABASE_ANON_KEY</code> to start syncing.
-              </div>
-            )}
-
-            {!positioningAvailable && hasSupabaseEnv && (
-              <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 p-3 text-sm text-amber-200">
-                Drag reorder requires a <code>position</code> column. Run the updated
-                SQL in <code>supabase/schema.sql</code> and refresh.
               </div>
             )}
 
@@ -1172,370 +934,160 @@ export function TodoApp() {
               </div>
             )}
 
-            <div className="space-y-2">
-              {isLoading && (
-                <div className="rounded-lg border border-border/80 bg-muted/50 p-4 text-sm text-muted-foreground">
-                  Loading tasks...
-                </div>
-              )}
+            {isLoading && (
+              <div className="rounded-lg border border-border/80 bg-muted/50 p-4 text-sm text-muted-foreground">
+                Loading tasks...
+              </div>
+            )}
 
-              {hasSupabaseEnv && (
-                <article
-                  ref={addCardRowRef}
-                  tabIndex={0}
-                  onClick={() => {
-                    if (!isAddCardActive) {
-                      setIsAddCardActive(true);
-                      return;
-                    }
+            {!isLoading &&
+              visibleTodos.map((todo) => {
+                const isBusy = busyId === todo.id;
+                const isEditing = editingId === todo.id;
+                const isCollapsed = collapsedTodoIdSet.has(todo.id);
+                const hasChildren = hasChildrenTodoIdSet.has(todo.id);
 
-                    focusAddCardField();
-                  }}
-                  onKeyDown={(event) => {
-                    if (moveArrowFocus(event)) {
-                      return;
-                    }
-                    if (event.target !== event.currentTarget) {
-                      return;
-                    }
-                    const isPrintableKey =
-                      event.key.length === 1 &&
-                      !event.metaKey &&
-                      !event.ctrlKey &&
-                      !event.altKey;
-                    if (!isAddCardActive && isPrintableKey) {
-                      event.preventDefault();
-                      setNewTitle(event.key);
-                      setIsAddCardActive(true);
-                      return;
-                    }
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      activateAddCardEditor();
-                    }
-                  }}
-                  className="px-0 py-3 transition hover:bg-muted/70 active:bg-muted/80"
-                  aria-label="Add task"
-                >
-                  {isAddCardActive ? (
-                    <div
-                      className="flex items-center gap-2.5 px-1"
-                      onClick={(event) => event.stopPropagation()}
-                    >
-                      <span
-                        aria-hidden="true"
-                        className="h-5 w-5 rounded-full border border-dashed border-muted-foreground/50"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          focusAddCardField();
-                        }}
-                      />
-                      <div
-                        ref={addCardFieldRef}
-                        contentEditable={!isAdding}
-                        suppressContentEditableWarning
-                        role="textbox"
-                        aria-label="Add task"
-                        onInput={(event) =>
-                          setNewTitle((event.currentTarget.textContent ?? "").slice(0, 120))
-                        }
-                        className="block min-h-[1.25rem] w-full cursor-text break-words align-top text-left text-[16px] leading-[1.4] outline-none"
-                        onBlur={() => {
-                          if (skipNextAddBlurSaveRef.current) {
-                            skipNextAddBlurSaveRef.current = false;
-                            return;
-                          }
-                          void handleCreateFromAddCard();
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter") {
-                            event.preventDefault();
-                            skipNextAddBlurSaveRef.current = true;
-                            void handleCreateFromAddCard();
-                            return;
-                          }
-                          if (event.key === "Escape") {
-                            event.preventDefault();
-                            skipNextAddBlurSaveRef.current = true;
-                            setIsAddCardActive(false);
-                            setNewTitle("");
-                          }
-                        }}
-                      />
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2.5 px-1">
-                      <span
-                        aria-hidden="true"
-                        className="h-5 w-5 rounded-full border border-dashed border-muted-foreground/50"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setIsAddCardActive(true);
-                        }}
-                      />
-                      <span className="text-sm text-muted-foreground/60">&nbsp;</span>
-                    </div>
-                  )}
-                </article>
-              )}
-
-              {!isLoading &&
-                filteredTodos.map((todo) => {
-                  const isBusy = busyId === todo.id;
-                  const isEditing = editingId === todo.id;
-                  const isDragging = draggingIds.includes(todo.id);
-                  const isSelected = selectedTodoIdSet.has(todo.id);
-                  const dragIntentShift =
-                    isDragging && dragHorizontalIntent === "nest"
-                      ? 16
-                      : isDragging && dragHorizontalIntent === "unnest"
-                        ? -16
-                        : 0;
-                  const depth = depthByTodoId[todo.id] ?? 0;
-
-                  return (
-                    <article
-                      key={todo.id}
-                      data-todo-id={todo.id}
-                      tabIndex={0}
-                      ref={(element) => {
-                        todoCardRefs.current[todo.id] = element;
-                      }}
-                      onPointerDown={(event) => handleCardPointerDown(event, todo)}
-                      onDoubleClick={(event) => handleCardDoubleClick(event, todo)}
-                      onContextMenu={(event) => event.preventDefault()}
-                      onKeyDown={(event) => {
-                        if (
-                          event.target === event.currentTarget &&
-                          event.key === "Escape"
-                        ) {
-                          event.preventDefault();
-                          setSelectedTodoIds([]);
-                          setSelectionAnchorId(null);
-                          (event.currentTarget as HTMLElement).blur();
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          (event.key === "Backspace" || event.key === "Delete")
-                        ) {
-                          event.preventDefault();
-                          void deleteFocusedSelection(todo.id);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          !event.repeat &&
-                          event.metaKey &&
-                          event.key === "ArrowLeft"
-                        ) {
-                          event.preventDefault();
-                          void unnestFocusedSelectionOneLevel(todo.id);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          !event.repeat &&
-                          event.metaKey &&
-                          event.key === "ArrowRight"
-                        ) {
-                          event.preventDefault();
-                          void nestFocusedSelectionIntoPrevious(todo.id);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          !event.repeat &&
-                          event.metaKey &&
-                          event.key === "ArrowUp"
-                        ) {
-                          event.preventDefault();
-                          void moveFocusedSelectionByOffset(todo.id, -1);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          !event.repeat &&
-                          event.metaKey &&
-                          event.key === "ArrowDown"
-                        ) {
-                          event.preventDefault();
-                          void moveFocusedSelectionByOffset(todo.id, 1);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          event.shiftKey &&
-                          event.key === "ArrowUp"
-                        ) {
-                          event.preventDefault();
-                          void moveShiftSelectionByOffset(todo.id, -1);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          event.shiftKey &&
-                          event.key === "ArrowDown"
-                        ) {
-                          event.preventDefault();
-                          void moveShiftSelectionByOffset(todo.id, 1);
-                          return;
-                        }
-                        if (
-                          event.target === event.currentTarget &&
-                          (event.key === "ArrowUp" || event.key === "ArrowDown")
-                        ) {
-                          setSelectedTodoIds([]);
-                          setSelectionAnchorId(null);
-                        }
-                        if (moveArrowFocus(event)) {
-                          return;
-                        }
-                        if (event.target !== event.currentTarget) {
-                          return;
-                        }
-                        if (moveHorizontalFocusInCard(event, todo.id)) {
-                          return;
-                        }
-                        if (event.key === " ") {
-                          event.preventDefault();
-                          void handleToggle(todo);
-                          return;
-                        }
-                        if (event.key === "Enter") {
-                          event.preventDefault();
-                          if (!hasSupabaseEnv || isBusy) {
-                            return;
-                          }
-                          startEdit(todo);
-                        }
-                      }}
-                      aria-label="Task card"
-                      className={cn(
-                        "relative overflow-visible px-0 py-3 transition hover:bg-muted/70 active:bg-muted/80",
-                        todo.is_completed && "opacity-70",
-                        isSelected && "bg-muted/60",
-                        isDragging && "bg-muted/80",
-                      )}
-                      style={
-                        isDragging || isSelected
-                          ? {
-                              outline: "auto",
-                              outlineOffset: "2px",
-                              transform:
-                                dragIntentShift !== 0
-                                  ? `translateX(${dragIntentShift}px)`
-                                  : undefined,
-                            }
-                          : undefined
+                return (
+                  <article
+                    key={todo.id}
+                    onMouseDown={(event) => {
+                      if (
+                        (event.target as HTMLElement).closest("[data-task-text='true']") ||
+                        (event.target as HTMLElement).closest("[data-collapse-toggle='true']")
+                      ) {
+                        return;
                       }
+                      setActiveTodoId(todo.id);
+                      setSelectedTodoIds([todo.id]);
+                      setSelectionAnchorId(todo.id);
+                    }}
+                    className={cn(
+                      "-mx-6 px-6 pt-2 pb-0 transition hover:bg-muted/40",
+                      (activeTodoId === todo.id || selectedTodoIdSet.has(todo.id)) &&
+                        "bg-muted/60",
+                      todo.is_completed && "opacity-70",
+                    )}
+                  >
+                    <div
+                      className="flex items-start gap-2.5 px-1"
+                      style={{ paddingLeft: `${(depthByTodoId[todo.id] ?? 0) * 10}px` }}
                     >
-                      <div
-                        className="relative flex items-start gap-2.5 px-1"
-                      >
-                        {depth > 0 && <div className="mr-1 shrink-0" style={{ width: `${depth * 16}px` }} />}
-                        <button
-                          type="button"
-                          aria-label={
-                            todo.is_completed
-                              ? "Mark task as not completed"
-                              : "Mark task as completed"
-                          }
+                      <button
+                        type="button"
+                        aria-label={
+                          todo.is_completed
+                            ? "Mark task as not completed"
+                            : "Mark task as completed"
+                        }
+                        className={cn(
+                          "mt-1 size-5 shrink-0 rounded-full border transition",
+                          todo.is_completed
+                            ? "border-primary bg-primary"
+                            : "border-muted-foreground/60 bg-transparent hover:border-primary",
+                        )}
+                        onClick={() => void handleToggle(todo)}
+                        disabled={!hasSupabaseEnv || isBusy}
+                      />
+
+                      <div className="min-w-0 flex-1 py-1">
+                        <textarea
+                          ref={(element) => {
+                            taskTextareaRefs.current[todo.id] = element;
+                          }}
+                          value={isEditing ? editingTitle : todo.title}
+                          readOnly={!isEditing}
+                          tabIndex={isEditing ? 0 : -1}
+                          onClick={() => {
+                            if (!isEditing && hasSupabaseEnv && !isBusy) {
+                              startEdit(todo);
+                            }
+                          }}
+                          onChange={(event) => {
+                            if (isEditing) {
+                              setEditingTitle(event.target.value);
+                            }
+                          }}
+                          onInput={(event) => resizeTextarea(event.currentTarget)}
+                          onBlur={() => {
+                            if (isEditing && !isBusy) {
+                              void saveEdit();
+                            }
+                          }}
+                          onKeyDown={(event) => {
+                            if (isEditing) {
+                              handleEditKeyDown(event);
+                            }
+                          }}
+                          rows={1}
+                          aria-label={`Edit task: ${todo.title}`}
+                          data-task-text="true"
                           className={cn(
-                            "h-5 w-5 rounded-full border transition",
-                            todo.is_completed
-                              ? "border-primary bg-primary"
-                              : "border-muted-foreground/60 bg-transparent hover:border-primary",
+                            "m-0 w-full resize-none overflow-hidden appearance-none border-0 bg-transparent p-0 text-[16px] leading-6 outline-none",
+                            !isEditing && "cursor-text select-none",
+                            isEditing && "select-text",
+                            todo.is_completed && "text-muted-foreground line-through",
                           )}
-                          ref={(element) => {
-                            todoDoneRefs.current[todo.id] = element;
-                          }}
-                          onKeyDown={(event) => {
-                            void moveHorizontalFocusInCard(event, todo.id);
-                          }}
-                          onClick={() => void handleToggle(todo)}
-                          disabled={!hasSupabaseEnv}
                         />
-
-                        <div className="min-w-0 flex-1">
-                          {isEditing ? (
-                            <span
-                              contentEditable={!isBusy}
-                              suppressContentEditableWarning
-                              role="textbox"
-                              aria-label={`Edit task: ${todo.title}`}
-                              onInput={(event) =>
-                                setEditingTitle(event.currentTarget.textContent ?? "")
-                              }
-                              ref={(element) => {
-                                editingFieldRefs.current[todo.id] = element;
-                                todoTextRefs.current[todo.id] = element;
-                              }}
-                              className="inline-block max-w-full break-words align-top text-left text-[16px] leading-[1.35] outline-none"
-                              onBlur={() => {
-                                if (skipNextEditBlurSaveRef.current) {
-                                  skipNextEditBlurSaveRef.current = false;
-                                  return;
-                                }
-                                if (!busyId) {
-                                  void saveEdit();
-                                }
-                              }}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter") {
-                                  event.preventDefault();
-                                  void saveEdit();
-                                }
-                                if (event.key === "Escape") {
-                                  event.preventDefault();
-                                  skipNextEditBlurSaveRef.current = true;
-                                  cancelEdit();
-                                }
-                              }}
-                            />
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => startEdit(todo)}
-                              disabled={!hasSupabaseEnv || isBusy}
-                              aria-label={`Edit task: ${todo.title}`}
-                              ref={(element) => {
-                                todoTextRefs.current[todo.id] = element;
-                              }}
-                              onKeyDown={(event) => {
-                                void moveHorizontalFocusInCard(event, todo.id);
-                              }}
-                              className={cn(
-                                "inline-block max-w-full break-words align-top text-left text-[16px] leading-[1.35]",
-                                todo.is_completed &&
-                                  "text-muted-foreground line-through",
-                              )}
-                            >
-                              {todo.title}
-                            </button>
-                          )}
-                        </div>
-
+                      </div>
+                      {hasChildren && (
                         <button
                           type="button"
-                          aria-label={`Open task menu for: ${todo.title}`}
-                          className="flex h-5 w-5 items-center justify-center text-muted-foreground"
-                          ref={(element) => {
-                            todoMenuRefs.current[todo.id] = element;
-                          }}
-                          onKeyDown={(event) => {
-                            void moveHorizontalFocusInCard(event, todo.id);
-                          }}
+                          data-collapse-toggle="true"
+                          onMouseDown={(event) => event.stopPropagation()}
+                          onClick={() => toggleCollapsedTodo(todo.id)}
+                          className="mt-1 shrink-0 text-muted-foreground transition hover:text-foreground"
+                          aria-label={isCollapsed ? "Show nested tasks" : "Hide nested tasks"}
+                          title={isCollapsed ? "Show nested tasks" : "Hide nested tasks"}
                         >
-                          <MoreHorizontal className="h-4 w-4" aria-hidden="true" />
+                          {isCollapsed ? (
+                            <ChevronRight className="h-4 w-4" aria-hidden="true" />
+                          ) : (
+                            <ChevronDown className="h-4 w-4" aria-hidden="true" />
+                          )}
                         </button>
+                      )}
 
-                      </div>
+                    </div>
+                  </article>
+                );
+              })}
 
-                    </article>
-                  );
-                })}
-            </div>
+            {hasSupabaseEnv && (
+              <form
+                onSubmit={(event: FormEvent<HTMLFormElement>) => {
+                  event.preventDefault();
+                  void submitNewTask();
+                }}
+                onMouseDown={() => {
+                  setActiveTodoId(NEW_TASK_ACTIVE_ID);
+                  setSelectedTodoIds([]);
+                  setSelectionAnchorId(null);
+                }}
+                className={cn(
+                  "-mx-6 px-6 pt-2 pb-0 transition hover:bg-muted/40",
+                  activeTodoId === NEW_TASK_ACTIVE_ID && "bg-muted/60",
+                )}
+              >
+                <div className="flex items-start gap-2.5">
+                  <span
+                    aria-hidden="true"
+                    className="mt-1 size-5 shrink-0 rounded-full border border-dashed border-muted-foreground/50"
+                  />
+                  <div className="min-w-0 flex-1 py-1">
+                    <textarea
+                      ref={newTaskInputRef}
+                      value={newTitle}
+                      onChange={(event) => setNewTitle(event.target.value)}
+                      onInput={(event) => resizeTextarea(event.currentTarget)}
+                      onKeyDown={handleNewTaskKeyDown}
+                      placeholder="Add a task"
+                      rows={1}
+                      className="m-0 w-full resize-none overflow-hidden appearance-none border-0 bg-transparent p-0 text-[16px] leading-6 outline-none placeholder:text-muted-foreground/70"
+                    />
+                  </div>
+                </div>
+              </form>
+            )}
           </CardContent>
         </Card>
       </div>
